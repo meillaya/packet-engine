@@ -30,24 +30,122 @@ install, configure, or claim a CNI plugin.
 
 ## Runtime architecture
 
-```text
-                 AF_XDP UMEM or DPDK ethdev queue 0
-                                |
-                         RX burst (max 64)
-                                |
-              Ethernet / IPv4 / IPv6 / L4 parser
-                                |
-             atomic rule snapshot (exact then IPv4 LPM)
-               |              |                 |
-            ALLOW       RATE_LIMIT/DROP     FORWARD
-               |                                |
-               |                  Ketama -> conntrack -> IPv4 NAT
-               +----------------+---------------+
-                                |
-                           TX or recycle
+```mermaid
+flowchart TB
+    %% packet-engine runtime architecture
+    %% Single run-to-completion polling thread + control-plane jthread.
 
-      Unix control socket                         TCP /metrics
-      GET/PUT rules, health                  counters + histogram
+    %% ────────────────────────────────────────────────────────────────
+    %% Dataplane: RX
+    %% ────────────────────────────────────────────────────────────────
+    subgraph RX["RX sources"]
+        direction LR
+        AF["AF_XDP UMEM<br/>veth · NIC · queue 0"]:::rx
+        DP["DPDK ethdev queue 0<br/>net_pcap · net_af_packet"]:::rx
+        RECV["recv_batch<br/>PacketDescriptor × &le; 64"]:::rx
+        AF --> RECV
+        DP --> RECV
+    end
+
+    %% ────────────────────────────────────────────────────────────────
+    %% Dataplane: per-packet processing
+    %% ────────────────────────────────────────────────────────────────
+    subgraph PROC["Per-packet processing"]
+        direction TB
+        SNAP(("rules_snapshot<br/>atomic shared_ptr load")):::snap
+        PARSE["parse_packet<br/>Ethernet II + VLAN tag<br/>IPv4 · IPv6 ext hdr walk<br/>TCP · UDP · ICMPv4 · ICMPv6<br/>zero-copy std::span views"]:::parse
+        V4CHKV4{"IPv4 ?"}:::dec
+        NATELIG{"NAT eligible ?<br/>IPv4 AND TCP/UDP AND --vip"}:::dec
+        MUT["Build MutablePacket<br/>l3 / l4 offsets · csum offsets<br/>TCP flags"]:::nat
+        EXIST["NatEngine::process_existing<br/>conntrack return-path<br/>swapped 5-tuple lookup"]:::nat
+        HIT1(("return-path hit")):::snap
+        LOOK["RuleTable::lookup_entry<br/>exact 5-tuple first<br/>then IPv4 CIDR LPM<br/>RATE_LIMIT token bucket"]:::rule
+        ACT{"action"}:::dec
+        FWDELIG{"FORWARD AND<br/>NAT eligible ?"}:::dec
+        FWD["NatEngine::process_forward<br/>Ketama pick on original tuple<br/>ephemeral-port alloc<br/>flows_.try_lookup_or_create<br/>in-place IPv4 L3 + L4 rewrite<br/>incremental csum (RFC 1624)"]:::nat
+        DEF["default_action<br/>DROP unless --default-action=allow"]:::snap
+
+        RECV --> SNAP --> PARSE --> V4CHKV4
+        V4CHKV4 -- "no (IPv6)" --> DEF
+        V4CHKV4 -- "yes" --> NATELIG
+        NATELIG -- "no" --> LOOK
+        NATELIG -- "yes" --> MUT --> EXIST
+        EXIST -- "hit" --> HIT1
+        EXIST -- "miss" --> LOOK
+        LOOK --> ACT
+        ACT -- "ALLOW" --> TXOK(("forward")):::snap
+        ACT -- "RATE_LIMIT<br/>(tokens)" --> TXOK
+        ACT -- "DROP" --> DROP(("drop")):::drop
+        ACT -- "FORWARD_TO_BACKEND" --> FWDELIG
+        FWDELIG -- "no · fail-closed" --> DROP
+        FWDELIG -- "yes" --> FWD
+        FWD -- "TX_TO_BACKEND_INTERFACE" --> TXOK
+        FWD -- "DROP · fail-closed" --> DROP
+        DEF -- "ALLOW" --> TXOK
+        DEF -- "DROP" --> DROP
+    end
+
+    %% ────────────────────────────────────────────────────────────────
+    %% Dataplane: TX + ownership lifecycle
+    %% ────────────────────────────────────────────────────────────────
+    subgraph TX["TX (TransmitBatch)"]
+        direction TB
+        FB["forward<br/>transmit_descriptors"]:::tx
+        DB["drop<br/>recycle_addresses (AF_XDP)<br/>or mbuf ledger (DPDK)"]:::tx
+        SEND["backend.send_batch<br/>accepted = N"]:::tx
+        KIND{"backend ?"}:::dec
+        RX_REC["recycle_rx_addresses<br/>ACKed frames → UMEM FILL"]:::tx
+        CPL["recycle_completions<br/>drain TX completion CQ"]:::tx
+        FILL["service_fill_ring<br/>refill FILL ring"]:::tx
+        REL["release_pending<br/>DPDK mbufs not accepted"]:::tx
+
+        HIT1 --> FB
+        TXOK --> FB --> SEND
+        DROP --> DB --> REL
+        SEND --> KIND
+        KIND -- "AF_XDP" --> RX_REC --> CPL --> FILL
+        KIND -- "DPDK" --> REL
+    end
+
+    %% ────────────────────────────────────────────────────────────────
+    %% Dataplane: metrics
+    %% ────────────────────────────────────────────────────────────────
+    MET["record_rx · record_tx · record_drop · record_latency_us<br/>MetricsEndpoint over TCP :metrics_port<br/>Prometheus text format"]:::metrics
+    SEND --> MET
+
+    %% ────────────────────────────────────────────────────────────────
+    %% Control plane (separate jthread)
+    %% ────────────────────────────────────────────────────────────────
+    subgraph CTL["Control plane (ControlApi · jthread)"]
+        direction TB
+        SOCK["AF_UNIX :control-socket<br/>HTTP/1.1 subset<br/>recv ≤ 64 KiB · 500 ms deadline"]:::ctl
+        RGET["GET /health · /rules"]:::ctl
+        RPUT["PUT /rules<br/>parse + validate<br/>build RuleTable off-path<br/>atomic shared_ptr swap"]:::ctl
+        BGET["GET /backends"]:::ctl
+        BPUT["PUT /backends<br/>parse + validate<br/>atomic replace<br/>BackendRegistry + Ketama ring"]:::ctl
+
+        SOCK --> RGET
+        SOCK --> RPUT
+        SOCK --> BGET
+        SOCK --> BPUT
+    end
+
+    RPUT -. "atomic publish" .-> SNAP
+    BPUT -. "atomic swap" .-> FWD
+
+    %% ────────────────────────────────────────────────────────────────
+    %% Styles
+    %% ────────────────────────────────────────────────────────────────
+    classDef rx fill:#dbeafe,stroke:#1d4ed8,color:#0c1f5e
+    classDef parse fill:#ede9fe,stroke:#6d28d9,color:#2e1065
+    classDef rule fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef nat fill:#fce7f3,stroke:#be185d,color:#500724
+    classDef tx fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef drop fill:#fee2e2,stroke:#b91c1c,color:#450a0a
+    classDef metrics fill:#cffafe,stroke:#0e7490,color:#083344
+    classDef snap fill:#f1f5f9,stroke:#475569,color:#0f172a
+    classDef dec fill:#fff7ed,stroke:#c2410c,color:#431407
+    classDef ctl fill:#fef9c3,stroke:#a16207,color:#422006
 ```
 
 Packet bytes are viewed through spans and NAT rewrites in place. AF_XDP frames
