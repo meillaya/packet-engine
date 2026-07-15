@@ -1,0 +1,120 @@
+{
+  "benchmark": "dpdk_net_pcap_offline_replay",
+  "comparisons": {
+    "af_xdp": {
+      "reason": "requires AF_XDP/XDP privileges, a suitable interface, and sufficient RLIMIT_MEMLOCK",
+      "status": "BLOCKED"
+    },
+    "kernel_networking": {
+      "reason": "requires CAP_NET_ADMIN to create the isolated veth/nftables comparison topology",
+      "status": "BLOCKED"
+    }
+  },
+  "measurement_scope": "end-to-end process startup, EAL initialization, replay, TX flush, and teardown",
+  "parameters": {
+    "eal_lcore": 0,
+    "measured_trials": 5,
+    "packets_per_trial": 10000,
+    "timeout_seconds": 30,
+    "warmup_trials": 1
+  },
+  "provenance": {
+    "build_configuration": "DPDK enabled; exact compiler flags are not embedded in the executable",
+    "clock": "time.monotonic_ns",
+    "cpu_model": "AMD Ryzen 7 5700X 8-Core Processor",
+    "dpdk_eal": "-l 0 -n 1 --no-huge --no-pci; net_pcap rx_pcap+tx_pcap",
+    "dpdk_version": "26.03.0",
+    "engine_path": "/home/mei/projects/kernel/kernel-v5/.verify/review-dpdk/packet-engine",
+    "engine_sha256": "e887094adacff5324fe5a5355f761a6a62983b58411a2073f74815840479c563",
+    "generated_at_utc": "2026-07-15T09:44:27.111426+00:00",
+    "hostname": "entropyos",
+    "input_pcap_path": "/home/mei/projects/kernel/kernel-v5/bench/results/dpdk-net-pcap/input.pcap",
+    "input_pcap_sha256": "a2a3cc8e1c917f893f83346fa99733f15126d84c370062e7a50a7b11b0c56e24",
+    "kernel": "7.1.3-2-cachyos",
+    "logical_cpu_count": 16,
+    "machine": "x86_64",
+    "numa_nodes_possible": "0",
+    "python": "3.12.8"
+  },
+  "schema_version": 1,
+  "status": "PASS",
+  "summary": {
+    "latency_unavailable_reason": "offline replay has no correlated ingress/egress packet timestamps; reporting process duration as packet latency would be misleading",
+    "max_packets_per_second": 30427.172,
+    "median_packets_per_second": 27850.459,
+    "min_packets_per_second": 24503.933,
+    "p50_latency_seconds": null,
+    "p99_latency_seconds": null,
+    "total_dropped_packets": 0
+  },
+  "trials": [
+    {
+      "dropped_packets": 0,
+      "elapsed_seconds": 0.361225959,
+      "input_packets": 10000,
+      "output_packets": 10000,
+      "p50_latency_seconds": null,
+      "p99_latency_seconds": null,
+      "packets_per_second": 27683.503,
+      "status": "PASS",
+      "trial": 1
+    },
+    {
+      "dropped_packets": 0,
+      "elapsed_seconds": 0.328653609,
+      "input_packets": 10000,
+      "output_packets": 10000,
+      "p50_latency_seconds": null,
+      "p99_latency_seconds": null,
+      "packets_per_second": 30427.172,
+      "status": "PASS",
+      "trial": 2
+    },
+    {
+      "dropped_packets": 0,
+      "elapsed_seconds": 0.408097752,
+      "input_packets": 10000,
+      "output_packets": 10000,
+      "p50_latency_seconds": null,
+      "p99_latency_seconds": null,
+      "packets_per_second": 24503.933,
+      "status": "PASS",
+      "trial": 3
+    },
+    {
+      "dropped_packets": 0,
+      "elapsed_seconds": 0.359060514,
+      "input_packets": 10000,
+      "output_packets": 10000,
+      "p50_latency_seconds": null,
+      "p99_latency_seconds": null,
+      "packets_per_second": 27850.459,
+      "status": "PASS",
+      "trial": 4
+    },
+    {
+      "dropped_packets": 0,
+      "elapsed_seconds": 0.335242115,
+      "input_packets": 10000,
+      "output_packets": 10000,
+      "p50_latency_seconds": null,
+      "p99_latency_seconds": null,
+      "packets_per_second": 29829.188,
+      "status": "PASS",
+      "trial": 5
+    }
+  ],
+  "warmup": [
+    {
+      "dropped_packets": 0,
+      "elapsed_seconds": 0.407382732,
+      "input_packets": 10000,
+      "output_packets": 10000,
+      "p50_latency_seconds": null,
+      "p99_latency_seconds": null,
+      "packets_per_second": 24546.941,
+      "status": "PASS",
+      "trial": 1
+    }
+  ]
+}

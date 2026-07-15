@@ -1,0 +1,11 @@
+benchmark=dpdk_net_pcap_offline_replay
+result=/home/mei/projects/kernel/kernel-v5/bench/results/dpdk-net-pcap/result.json
+trials=/home/mei/projects/kernel/kernel-v5/bench/results/dpdk-net-pcap/trials.csv
+engine=/home/mei/projects/kernel/kernel-v5/.verify/review-dpdk/packet-engine
+engine_sha256=e887094adacff5324fe5a5355f761a6a62983b58411a2073f74815840479c563
+input_pcap=/home/mei/projects/kernel/kernel-v5/bench/results/dpdk-net-pcap/input.pcap
+input_pcap_sha256=a2a3cc8e1c917f893f83346fa99733f15126d84c370062e7a50a7b11b0c56e24
+warmup_trials=1
+measured_trials=5
+packets_per_trial=10000
+eal_lcore=0

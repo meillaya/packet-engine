@@ -1,0 +1,7 @@
+phase,trial,status,elapsed_seconds,input_packets,output_packets,dropped_packets,packets_per_second
+warmup,1,PASS,0.407382732,10000,10000,0,24546.941
+measured,1,PASS,0.361225959,10000,10000,0,27683.503
+measured,2,PASS,0.328653609,10000,10000,0,30427.172
+measured,3,PASS,0.408097752,10000,10000,0,24503.933
+measured,4,PASS,0.359060514,10000,10000,0,27850.459
+measured,5,PASS,0.335242115,10000,10000,0,29829.188

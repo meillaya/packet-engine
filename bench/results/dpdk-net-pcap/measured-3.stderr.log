@@ -1,0 +1,8 @@
+EAL: Detected CPU lcores: 16
+EAL: Detected NUMA nodes: 1
+EAL: Detected shared linkage of DPDK
+EAL: Multi-process socket /run/user/1000/dpdk/pe-bench-1450601-4/mp_socket
+EAL: Selected IOVA mode 'VA'
+[09:44:25] [INFO] pid=1451445 tid=4452753935260527803 /home/mei/projects/kernel/kernel-v5/src/backend_dpdk.cpp:134 DpdkBackend: rte_eal_init consumed 8 argv entries
+[09:44:26] [INFO] pid=1451445 tid=4452753935260527803 /home/mei/projects/kernel/kernel-v5/src/backend_dpdk.cpp:222 DpdkBackend: port 0 link status: 1
+[09:44:26] [INFO] pid=1451445 tid=4452753935260527803 /home/mei/projects/kernel/kernel-v5/src/backend_dpdk.cpp:225 DpdkBackend: initialised port=0 q=0 pool="mbuf_pool" mbufs=8192

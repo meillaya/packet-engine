@@ -1,0 +1,2 @@
+capability backend=dpdk port=net_pcap_pe_bench_2 queue=0 mode=copy-backed zero-copy=false
+runtime received=10000 transmitted=10000 dropped=0
