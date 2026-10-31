@@ -42,10 +42,14 @@ struct alignas(64) WorkerCounters {
     std::atomic<uint64_t> latency_observations{0};
     std::atomic<uint64_t> latency_sum_us{0}; // sum of observations in us
 
-    // Pad to a full cache line (or two) so two WorkerCounters never share a line.
-    // With 13 atomic uint64_t = 104 bytes, alignas(64) plus padding guarantees
-    // at least one cache line of separation.
-    std::byte padding[64 - (13 * sizeof(uint64_t)) % 64]{};
+    // Pad to a cache-line boundary so two WorkerCounters never share a line.
+    // There are 15 counters: rx, drops, tx, ten latency buckets, observations,
+    // and the microsecond sum.  At 8 bytes each that is 120 bytes, so 8 bytes
+    // of padding bring the struct to two cache lines (128 bytes).
+    static constexpr std::size_t kCounterCount = 3u + kLatencyBuckets + 2u;
+    static constexpr std::size_t kCounterBytes = kCounterCount * sizeof(std::atomic<uint64_t>);
+    static constexpr std::size_t kPaddingBytes = (64u - (kCounterBytes % 64u)) % 64u;
+    std::byte padding[kPaddingBytes]{};
 };
 
 static_assert(alignof(WorkerCounters) >= 64, "WorkerCounters must be cache-line aligned");

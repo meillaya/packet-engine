@@ -118,7 +118,7 @@ void pin_to_node(int target_node) noexcept {
         return;
     }
     const int max_cpu = numa_num_configured_cpus();
-    for (int c = 0; c < max_cpu; ++c) {
+    for (int c = 0; c < max_cpu && c < CPU_SETSIZE; ++c) {
         if (numa_bitmask_isbitset(bm, c)) {
             CPU_SET(c, &cpus);
         }
@@ -213,7 +213,17 @@ FrameAllocator::FrameAllocator(std::uint32_t num_frames, std::uint32_t frame_siz
     // 8) Allocate bookkeeping.  Cold path -- one allocation per
     //    FrameAllocator instance.  std::atomic<bool> default-inits to
     //    `false`, so no separate zero-fill loop is needed.
-    bitmap_ = std::make_unique<std::atomic<bool>[]>(num_frames_);
+    try {
+        bitmap_ = std::make_unique<std::atomic<bool>[]>(num_frames_);
+        // Release is noexcept and runs on the drop path.  Reserve the
+        // maximum stack depth up front so recycling never allocates.
+        free_stack_.reserve(num_frames_);
+    } catch (...) {
+        // The destructor does not run for a partially constructed object.
+        munmap_region(base_, static_cast<std::size_t>(total_size_));
+        base_ = nullptr;
+        throw;
+    }
 }
 
 FrameAllocator::~FrameAllocator() {

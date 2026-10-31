@@ -55,6 +55,9 @@ find_package(Boost REQUIRED)
 pkg_check_modules(LIBXDP REQUIRED libxdp)
 pkg_check_modules(LIBBPF REQUIRED libbpf)
 pkg_check_modules(NLOHMANN_JSON REQUIRED nlohmann_json)
+# libelf is a libbpf dependency.  Probe it directly so the build does not
+# depend on a machine-specific nix store path for the rpath.
+pkg_check_modules(LIBELF libelf)
 
 # libnuma is optional -- the FrameAllocator falls back to plain mmap
 # when NUMACTL is missing, and the test suite skips the NUMA assertions.
@@ -64,21 +67,17 @@ if(ENABLE_DPDK)
   pkg_check_modules(DPDK REQUIRED libdpdk)
 endif()
 
-# libbpf depends on libelf from the nixpkgs elfutils package.  pkg-config for
-# libbpf in the nix shell does not expose the elfutils -L path, and the nix
-# store versions of libbpf/libxdp must be preferred over the host /usr/lib
-# copies at runtime.  Embed the relevant nix store lib directories in every
-# executable's rpath.
-set(ELFUTILS_LIB_DIR "/nix/store/6nrfjqgkbgwjrszrn9dfv5k7kj7vxxfk-elfutils-0.194/lib")
+# libbpf depends on libelf.  Keep the discovered library directories in the
+# rpath so the nix store copies win over host libraries at runtime.
 list(APPEND CMAKE_BUILD_RPATH
   ${LIBBPF_LIBRARY_DIRS}
   ${LIBXDP_LIBRARY_DIRS}
-  "${ELFUTILS_LIB_DIR}"
+  ${LIBELF_LIBRARY_DIRS}
 )
 list(APPEND CMAKE_INSTALL_RPATH
   ${LIBBPF_LIBRARY_DIRS}
   ${LIBXDP_LIBRARY_DIRS}
-  "${ELFUTILS_LIB_DIR}"
+  ${LIBELF_LIBRARY_DIRS}
 )
 
 # -----------------------------------------------------------------------------
@@ -202,8 +201,8 @@ target_sources(packet-engine PRIVATE src/main.cpp src/runtime_context.cpp)
 target_link_libraries(packet-engine PRIVATE packet_engine_core)
 add_dependencies(packet-engine af_xdp_kern)
 set_target_properties(packet-engine PROPERTIES
-  BUILD_RPATH "${LIBBPF_LIBRARY_DIRS};${LIBXDP_LIBRARY_DIRS};${ELFUTILS_LIB_DIR}"
-  INSTALL_RPATH "${LIBBPF_LIBRARY_DIRS};${LIBXDP_LIBRARY_DIRS};${ELFUTILS_LIB_DIR}"
+  BUILD_RPATH "${LIBBPF_LIBRARY_DIRS};${LIBXDP_LIBRARY_DIRS};${LIBELF_LIBRARY_DIRS}"
+  INSTALL_RPATH "${LIBBPF_LIBRARY_DIRS};${LIBXDP_LIBRARY_DIRS};${LIBELF_LIBRARY_DIRS}"
 )
 
 # -----------------------------------------------------------------------------

@@ -51,6 +51,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace packet_engine {
@@ -141,7 +142,10 @@ class ConntrackFlowCache {
     /// entries due to the table's `kMaxSize = kLoadFactorCap` clamp.
     static constexpr std::size_t kCapacity = 65536;
 
-    ConntrackFlowCache() noexcept = default;
+    /// Builds the two hash tables on the heap.  Each table is several
+    /// megabytes; keeping them out of the object footprint lets tests and
+    /// callers store the cache on the stack without exhausting it.
+    ConntrackFlowCache();
 
     ConntrackFlowCache(const ConntrackFlowCache&) = delete;
     ConntrackFlowCache& operator=(const ConntrackFlowCache&) = delete;
@@ -196,10 +200,10 @@ class ConntrackFlowCache {
                            std::uint64_t idle_timeout_ns = kDefaultIdleTimeoutNs,
                            std::size_t slice = kDefaultEvictionSlice) noexcept;
 
-    /// Number of live entries in the cache (equal to `table_.size()`).
-    [[nodiscard]] std::size_t size() const noexcept { return table_.size(); }
+    /// Number of live entries in the cache (equal to `table_->size()`).
+    [[nodiscard]] std::size_t size() const noexcept { return table_->size(); }
 
-    [[nodiscard]] bool empty() const noexcept { return table_.empty(); }
+    [[nodiscard]] bool empty() const noexcept { return table_->empty(); }
 
     /// Live capacity available under the table's load-factor cap.  Useful
     /// for adaptive callers that want to stay ahead of the refusal threshold.
@@ -214,8 +218,11 @@ class ConntrackFlowCache {
     static void transition_tcp_state(TcpState& state, std::uint8_t flags) noexcept;
 
   private:
-    OpenAddrHashTable<FiveTuple, FlowEntry, kCapacity> table_;
-    OpenAddrHashTable<FiveTuple, FiveTuple, kCapacity> translations_;
+    using FlowTable = OpenAddrHashTable<FiveTuple, FlowEntry, kCapacity>;
+    using TranslationTable = OpenAddrHashTable<FiveTuple, FiveTuple, kCapacity>;
+
+    std::unique_ptr<FlowTable> table_;
+    std::unique_ptr<TranslationTable> translations_;
 
     // Auxiliary index used for incremental eviction.  Append-on-insert,
     // swap-remove-on-evict so the vector stays compact; the cursor wraps

@@ -18,7 +18,7 @@ exercised on this host.
 |---|---|---|
 | AF_XDP | UMEM RX/TX, FILL and completion recycling, an owned XDP redirect program, and a `getsockopt` mode query. | Needs an interface, BPF and network capabilities, and memlock. Startup prints `mode=copy`, `mode=zero-copy`, or `mode=unknown`. Only `zero-copy` proves zero-copy. |
 | DPDK | EAL and ethdev setup, one RX/TX queue, mbuf ownership, and bounded shutdown. | `net_pcap` is tested without privileges. `net_af_packet` is a privileged, copy-backed veth demo. Neither proves PCI kernel bypass or zero-copy. |
-| Parser | Ethernet II, one VLAN tag, IPv4, an IPv6 extension walk, TCP, UDP, ICMPv4, ICMPv6 classification, and checksum validation. | IPv4 TCP/UDP fragments fail closed. IPv4 UDP checksum zero is accepted; IPv6 UDP checksum zero is rejected. Policy lookup and NAT are IPv4 only. |
+| Parser | Ethernet II, one VLAN tag, IPv4, an IPv6 extension walk, TCP, UDP, ICMPv4, ICMPv6 classification, and checksum validation. | IPv4 TCP/UDP fragments fail closed, and IPv6 fragments fail closed except atomic fragments. IPv4 UDP checksum zero is accepted; IPv6 UDP checksum zero is rejected. Policy lookup and NAT are IPv4 only. |
 | Policy | Exact IPv4 five-tuple, IPv4 CIDR longest-prefix match, and four actions. | Tables are built off-path and swapped atomically. `RATE_LIMIT` transmits while tokens remain and drops after exhaustion. |
 | L4 LB and NAT | Ketama hashing, optional backend pinning, health probing, conntrack, one-arm Ethernet rewrite, and in-place TCP/UDP checksum updates. | Enabled with `--vip`. A `FORWARD` rule without a usable VIP path, backend, or next-hop MAC fails closed. |
 | Observability | RX, TX, and drop counters plus a batch-duration histogram. | Histogram values are batch processing times in the executable, not wire RTT. |
@@ -413,6 +413,10 @@ privileged comparison protocol.
 - NUMA-aware components are implemented, but the one-thread runtime does not
   expose a verified queue-to-core-to-NIC NUMA report.
 - The control socket is local and unauthenticated. Metrics are plaintext.
+- The exact-rule hash table has a fixed capacity and a bounded probe budget.
+  A replacement that exhausts either is rejected instead of growing the table.
+- The conntrack cache holds at most 32768 flows. New flows fail closed once the
+  table is saturated.
 - Kubernetes CNI support, production hardening, and compatibility guarantees
   are out of scope.
 

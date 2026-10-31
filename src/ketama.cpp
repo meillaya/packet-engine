@@ -130,18 +130,11 @@ std::vector<ContinuumPoint> ketama_points_for_backend(KetamaBackendId id,
     // Build points via the libketama recipe: 40 replicas, each contributing
     // 4 32-bit continuum points extracted from the MD5 of "<addr>-<i>".
     for (std::uint32_t rep = 0; rep < KetamaRing::kReplicasPerBackend; ++rep) {
-        // Compose "<addr>-<rep>" into a stack buffer.  libketama writes
-        // up to 32 bytes for the address; we over-allocate to handle
-        // pathological addresses without heap allocation.
-        char key[96];
-        int n = std::snprintf(key, sizeof(key), "%.*s-%u", static_cast<int>(address.size()),
-                              address.data(), rep);
-        if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(key)) {
-            // Pathological address length; skip this replica.
-            continue;
-        }
-
-        const auto digest = compute_md5(key, static_cast<std::size_t>(n));
+        // Compose "<addr>-<rep>".  Build the string instead of formatting
+        // into a fixed buffer: control-plane authorities are arbitrary
+        // strings, and a long one must still get its 160 ring points.
+        const std::string key = std::string(address) + "-" + std::to_string(rep);
+        const auto digest = compute_md5(key.data(), key.size());
 
         // Extract 4 little-endian u32s from the 16-byte digest.
         // libketama uses (digest[3]<<24)|(digest[2]<<16)|(digest[1]<<8)|digest[0],

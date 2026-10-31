@@ -90,6 +90,28 @@ TEST(CidrTrieTest, IPv4_DefaultRouteMatchesAll) {
     EXPECT_EQ(trie.lookup(ipv4(255, 255, 255, 255)), 1);
 }
 
+TEST(CidrTrieTest, IPv4_EraseDefaultRouteReleasesRoot) {
+    CidrTrie<IPv4Addr> trie;
+    ASSERT_TRUE(trie.insert(ipv4(0, 0, 0, 0), 0, 1));
+    ASSERT_TRUE(trie.erase(ipv4(0, 0, 0, 0), 0));
+    EXPECT_TRUE(trie.empty());
+    EXPECT_FALSE(trie.lookup(ipv4(10, 0, 0, 1)).has_value());
+
+    // The root node was freed.  A later insert must not reuse it while the
+    // trie still points at it, and unrelated addresses must not match.
+    ASSERT_TRUE(trie.insert(ipv4(192, 168, 0, 0), 16, 2));
+    EXPECT_EQ(trie.lookup(ipv4(192, 168, 1, 1)), 2);
+    EXPECT_FALSE(trie.lookup(ipv4(10, 0, 0, 1)).has_value());
+    EXPECT_FALSE(trie.lookup(ipv4(172, 16, 0, 1)).has_value());
+    // These two addresses followed the dangling root's reused child before
+    // the root was cleared and matched the /16 rule.
+    EXPECT_FALSE(trie.lookup(ipv4(2, 160, 0, 1)).has_value());
+    EXPECT_FALSE(trie.lookup(ipv4(129, 80, 0, 1)).has_value());
+
+    ASSERT_TRUE(trie.insert(ipv4(0, 0, 0, 0), 0, 3));
+    EXPECT_EQ(trie.lookup(ipv4(10, 0, 0, 1)), 3);
+}
+
 TEST(CidrTrieTest, IPv4_EraseLeafAndInterior) {
     CidrTrie<IPv4Addr> trie;
     ASSERT_TRUE(trie.insert(ipv4(10, 0, 0, 0), 8, 8));

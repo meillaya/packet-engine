@@ -749,6 +749,21 @@ TEST(ParserTest, Ipv6NonInitialFragmentCannotSupplyTransportPorts) {
     EXPECT_FALSE(pe::parse_packet(as_bytes(pkt)).has_value());
 }
 
+TEST(ParserTest, Ipv6MoreFragmentsIsRejected) {
+    // Given: a first fragment (offset 0) that declares more fragments.
+    std::uint8_t pkt[70] = {};
+    std::memcpy(pkt, kIpv6Udp, 14);
+    pkt[14] = 0x60;
+    pkt[14 + 4] = 0x00;
+    pkt[14 + 5] = 0x10;
+    pkt[14 + 6] = 44; // next = Fragment
+    pkt[14 + 40] = 17;
+    pkt[14 + 40 + 3] = 0x01; // fragment offset 0, M = 1
+
+    // When/Then: no reassembly path exists, so the fragment fails closed.
+    EXPECT_FALSE(pe::parse_packet(as_bytes(pkt)).has_value());
+}
+
 TEST(ParserTest, ReturnsZeroCopyViewsFromLargerBuffer) {
     // Wrap a 4 KiB buffer; embed a packet at offset 100.  Parser must
     // hand back spans pointing at the embedded offset, not at 0.

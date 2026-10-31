@@ -212,6 +212,28 @@ TEST(OpenAddrHashTableTest, InsertAtCapRefusesFurtherInserts) {
     EXPECT_EQ(t.find(k), nullptr);
 }
 
+TEST(OpenAddrHashTableTest, UpdateExistingKeyAtCap) {
+    SmallTable t;
+    FiveTuple first = make_tuple(1, 2, 3, 4);
+    ASSERT_TRUE(t.insert(first, make_rule(1, Action::DROP)));
+
+    std::uint32_t i = 0;
+    for (; i < 1024; ++i) {
+        FiveTuple k = make_tuple(i + 100, ~(i + 100), static_cast<std::uint16_t>(i),
+                                 static_cast<std::uint16_t>(i >> 8));
+        if (!t.insert(k, make_rule(i + 2, Action::ALLOW)))
+            break;
+    }
+    ASSERT_EQ(t.size(), SmallTable::kMaxSize);
+
+    // The table is full, but an existing key must still accept a new value.
+    ASSERT_TRUE(t.insert(first, make_rule(777, Action::RATE_LIMIT)));
+    const auto* updated = t.find(first);
+    ASSERT_NE(updated, nullptr);
+    EXPECT_EQ(updated->id, 777u);
+    EXPECT_EQ(updated->action, Action::RATE_LIMIT);
+}
+
 TEST(OpenAddrHashTableTest, ClearResetsSizeAndSlots) {
     SmallTable t;
     for (std::uint32_t i = 0; i < 32; ++i) {

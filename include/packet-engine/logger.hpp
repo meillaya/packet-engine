@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <string_view>

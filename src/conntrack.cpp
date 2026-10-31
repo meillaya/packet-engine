@@ -15,6 +15,13 @@
 
 namespace packet_engine {
 
+ConntrackFlowCache::ConntrackFlowCache()
+    : table_{std::make_unique<FlowTable>()}, translations_{std::make_unique<TranslationTable>()} {
+    // A live flow is at most one entry, and the hash table refuses inserts at
+    // kMaxSize.  Reserve the index once so the packet path never allocates.
+    eviction_keys_.reserve(kCapacity / 2);
+}
+
 // ---------------------------------------------------------------------------
 // TCP state machine.  See header for the transition table.
 // ---------------------------------------------------------------------------
@@ -71,15 +78,15 @@ void ConntrackFlowCache::transition_tcp_state(TcpState& s, std::uint8_t flags) n
 // ---------------------------------------------------------------------------
 // peeking helpers -- thin wrappers around OpenAddrHashTable::find.
 // ---------------------------------------------------------------------------
-FlowEntry* ConntrackFlowCache::peek(const FiveTuple& key) noexcept { return table_.find(key); }
+FlowEntry* ConntrackFlowCache::peek(const FiveTuple& key) noexcept { return table_->find(key); }
 
 const FlowEntry* ConntrackFlowCache::peek(const FiveTuple& key) const noexcept {
-    return table_.find(key);
+    return table_->find(key);
 }
 
 FlowEntry* ConntrackFlowCache::touch(const FiveTuple& key, std::uint64_t now_ns,
                                      std::uint8_t tcp_flags) noexcept {
-    FlowEntry* entry = table_.find(key);
+    FlowEntry* entry = table_->find(key);
     if (entry != nullptr) {
         entry->last_seen_ns = now_ns;
         transition_tcp_state(entry->tcp_state, tcp_flags);
@@ -88,14 +95,14 @@ FlowEntry* ConntrackFlowCache::touch(const FiveTuple& key, std::uint64_t now_ns,
 }
 
 FlowEntry* ConntrackFlowCache::peek_translation(const FiveTuple& translated_key) noexcept {
-    const FiveTuple* original_key = translations_.find(translated_key);
-    return original_key == nullptr ? nullptr : table_.find(*original_key);
+    const FiveTuple* original_key = translations_->find(translated_key);
+    return original_key == nullptr ? nullptr : table_->find(*original_key);
 }
 
 const FlowEntry*
 ConntrackFlowCache::peek_translation(const FiveTuple& translated_key) const noexcept {
-    const FiveTuple* original_key = translations_.find(translated_key);
-    return original_key == nullptr ? nullptr : table_.find(*original_key);
+    const FiveTuple* original_key = translations_->find(translated_key);
+    return original_key == nullptr ? nullptr : table_->find(*original_key);
 }
 
 FlowEntry* ConntrackFlowCache::touch_translation(const FiveTuple& translated_key,
@@ -111,10 +118,10 @@ FlowEntry* ConntrackFlowCache::touch_translation(const FiveTuple& translated_key
 
 bool ConntrackFlowCache::bind_translation(const FiveTuple& translated_key,
                                           const FiveTuple& original_key) noexcept {
-    if (table_.find(original_key) == nullptr) {
+    if (table_->find(original_key) == nullptr) {
         return false;
     }
-    return translations_.insert(translated_key, original_key);
+    return translations_->insert(translated_key, original_key);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +138,7 @@ FlowEntry& ConntrackFlowCache::lookup_or_create(const FiveTuple& key,
 
 FlowEntry* ConntrackFlowCache::try_lookup_or_create(const FiveTuple& key,
                                                     const ConntrackLookupArgs& args) noexcept {
-    if (auto* hit = table_.find(key)) {
+    if (auto* hit = table_->find(key)) {
         hit->last_seen_ns = args.now_ns;
         transition_tcp_state(hit->tcp_state, args.tcp_flags);
         return hit;
@@ -157,9 +164,9 @@ FlowEntry* ConntrackFlowCache::try_lookup_or_create(const FiveTuple& key,
     fresh.last_seen_ns = args.now_ns;
     transition_tcp_state(fresh.tcp_state, args.tcp_flags);
 
-    if (table_.insert(key, fresh)) {
+    if (table_->insert(key, fresh)) {
         eviction_keys_.push_back(key);
-        return table_.find(key);
+        return table_->find(key);
     }
     return nullptr;
 }
@@ -187,16 +194,16 @@ void ConntrackFlowCache::erase_translation(const FiveTuple& original_key,
     const FiveTuple translated_key{original_key.dst_ip,
                                    IPv4Addr{static_cast<std::uint32_t>(entry.backend_ip)},
                                    entry.engine_sport, entry.backend_port, original_key.proto};
-    (void)translations_.erase(translated_key);
+    (void)translations_->erase(translated_key);
 }
 
 bool ConntrackFlowCache::erase(const FiveTuple& original_key) noexcept {
-    FlowEntry* entry = table_.find(original_key);
+    FlowEntry* entry = table_->find(original_key);
     if (entry == nullptr) {
         return false;
     }
     const FlowEntry snapshot = *entry;
-    if (!table_.erase(original_key)) {
+    if (!table_->erase(original_key)) {
         return false;
     }
     erase_translation(original_key, snapshot);
@@ -235,12 +242,12 @@ std::size_t ConntrackFlowCache::evict_idle(std::uint64_t now_ns, std::uint64_t i
 
     for (std::size_t step = 0; step < budget; ++step) {
         FiveTuple key = eviction_keys_[evict_cursor_];
-        if (auto* entry = table_.find(key)) {
+        if (auto* entry = table_->find(key)) {
             if (now_ns > entry->last_seen_ns && (now_ns - entry->last_seen_ns) > idle_timeout_ns) {
                 const FlowEntry snapshot = *entry;
                 erase_translation(key, snapshot);
                 notify_eviction(snapshot);
-                (void)table_.erase(key);
+                (void)table_->erase(key);
                 ++evicted;
                 // Swap-remove from the auxiliary index: move the last
                 // element into this slot and shrink.  Compaction keeps
@@ -289,17 +296,17 @@ std::size_t ConntrackFlowCache::evict_idle(std::uint64_t now_ns, std::uint64_t i
 
 std::size_t ConntrackFlowCache::remaining_capacity() const noexcept {
     const std::size_t cap = OpenAddrHashTable<FiveTuple, FlowEntry, kCapacity>::kMaxSize;
-    return table_.size() >= cap ? 0 : (cap - table_.size());
+    return table_->size() >= cap ? 0 : (cap - table_->size());
 }
 
 void ConntrackFlowCache::clear() noexcept {
     for (const FiveTuple& key : eviction_keys_) {
-        if (const FlowEntry* entry = table_.find(key)) {
+        if (const FlowEntry* entry = table_->find(key)) {
             notify_eviction(*entry);
         }
     }
-    table_.clear();
-    translations_.clear();
+    table_->clear();
+    translations_->clear();
     eviction_keys_.clear();
     evict_cursor_ = 0;
 }

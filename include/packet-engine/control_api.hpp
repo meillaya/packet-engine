@@ -65,6 +65,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -118,7 +119,7 @@ class ControlApi {
     // HTTP-like request handlers.  Each returns a fully-formed HTTP/1.1
     // response string (headers + body), ready to send back over the socket.
     [[nodiscard]] std::string handle_request(std::string_view method, std::string_view path,
-                                             std::string_view body) const;
+                                             std::string_view body);
 
     // Build a fixed HTTP/1.1 response with status line, Content-Type,
     // Content-Length, and `Connection: close`.

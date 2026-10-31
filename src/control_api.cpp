@@ -16,6 +16,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -209,6 +210,8 @@ BackendUpdate parse_backend_update(std::string_view body) {
         const auto authority = item.at("authority").get<std::string>();
         if (authority.empty())
             return {{}, "backend authority must not be empty"};
+        if (authority.find('\0') != std::string::npos)
+            return {{}, "backend authority must not contain a NUL byte"};
 
         const auto health_port = parse_json_u64(item.at("health_port"));
         if (!health_port || *health_port > std::numeric_limits<std::uint16_t>::max()) {
@@ -493,7 +496,7 @@ void ControlApi::handle_connection(int client_fd) {
 }
 
 std::string ControlApi::handle_request(std::string_view method, std::string_view path,
-                                       std::string_view body) const {
+                                       std::string_view body) {
     if (method == "GET" && path == "/health") {
         return build_http_response(200, "application/json", R"({"status":"ok"})");
     }
@@ -509,8 +512,10 @@ std::string ControlApi::handle_request(std::string_view method, std::string_view
     if (method == "PUT" && path == "/rules") {
         auto parsed = parse_rules_json(std::string(body));
         if (!parsed) {
-            auto error_body = std::string("{\"error\":\"") + parsed.error().message + "\"}";
-            return build_http_response(400, "application/json", error_body);
+            // Error messages can contain quotes from the JSON parser; let
+            // nlohmann escape them instead of splicing raw text.
+            return build_http_response(400, "application/json",
+                                       Json{{"error", parsed.error().message}}.dump());
         }
 
         auto table = std::make_shared<RuleTable>();
@@ -610,7 +615,7 @@ std::string ControlApi::handle_request(std::string_view method, std::string_view
             }
         }
 
-        const_cast<ControlApi*>(this)->publish_rule_table_(std::move(table), std::move(rule_list));
+        publish_rule_table_(std::move(table), std::move(rule_list));
         return build_http_response(200, "application/json", R"({"ok":true})");
     }
 

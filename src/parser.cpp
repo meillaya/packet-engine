@@ -295,7 +295,12 @@ std::optional<L3Outcome> parse_ipv6(std::span<const std::byte> buf) noexcept {
                 return std::nullopt;
             }
             const std::uint16_t fragment_offset_and_flags = read_be16(cursor.data() + 2);
-            if ((fragment_offset_and_flags & 0xFFF8u) != 0) {
+            // The engine has no reassembly path.  Reject every fragment
+            // except an atomic one (offset 0, M 0), matching the IPv4
+            // fail-closed fragment policy.
+            constexpr std::uint16_t kFragmentOffsetMask = 0xFFF8u;
+            constexpr std::uint16_t kMoreFragments = 0x0001u;
+            if ((fragment_offset_and_flags & (kFragmentOffsetMask | kMoreFragments)) != 0) {
                 return std::nullopt;
             }
             next_proto = static_cast<std::uint8_t>(cursor[0]);

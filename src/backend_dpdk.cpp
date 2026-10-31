@@ -317,6 +317,14 @@ bool DpdkBackend::track_mbuf(rte_mbuf* mbuf, std::uint32_t index) noexcept {
         }
         slot = (slot + 1u) & (kOwnershipSlots - 1u);
     }
+    // The table can fill with tombstones after enough RX/TX churn.  There
+    // is no empty slot left to terminate a probe run, but a tombstone is
+    // safe to reuse: lookups skip tombstones and the duplicate scan above
+    // already covered every slot.
+    if (deleted != kOwnershipSlots) {
+        (*ownership_slots_)[deleted] = {mbuf, index};
+        return true;
+    }
     return false;
 }
 

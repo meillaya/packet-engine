@@ -388,6 +388,14 @@ TEST(KetamaTest, PickOnFiveTupleReturnsBackend) {
     EXPECT_EQ(ring.pick(t2), ring.pick(t2));
 }
 
+TEST(KetamaTest, LongAuthorityStillGetsRingPoints) {
+    const std::string address = "backend-" + std::string(120, 'x') + ":8080";
+    pe::KetamaRing ring{{pe::KetamaBackend{7, address}}};
+    EXPECT_EQ(ring.backend_count(), 1u);
+    EXPECT_EQ(ring.size(), pe::KetamaRing::kPointsPerBackend);
+    EXPECT_EQ(ring.pick(make_tuple(0x0A000001u, 0x0A000002u, 1234, 80)), 7u);
+}
+
 // ===========================================================================
 // Atomic swap safety: concurrent readers + mutator
 // ===========================================================================

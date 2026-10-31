@@ -104,7 +104,10 @@ AfXdpBackend::AfXdpBackend(FrameAllocator& allocator, std::string_view interface
     // reserved in one call (kernel rounds the sizes up to power-of-two).
     umem_cfg_.fill_size = NUM_FRAMES;
     umem_cfg_.comp_size = NUM_FRAMES;
-    umem_cfg_.frame_size = FrameAllocator::DEFAULT_FRAME_SIZE;
+    // Descriptor addresses are allocator offsets.  The allocator rounds the
+    // frame size up to the system page size, so the UMEM chunk size must use
+    // that same value.  On the usual 4 KiB-page host this is 4096.
+    umem_cfg_.frame_size = allocator_.frame_size();
     umem_cfg_.frame_headroom = 0;
     umem_cfg_.flags = 0;
 

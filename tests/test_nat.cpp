@@ -23,10 +23,12 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -60,8 +62,17 @@ namespace {
     return value;
 }
 
+[[nodiscard]] std::uint16_t load_be16(const std::byte* data) noexcept {
+    return pe::bswap16_helper(load_u16(data));
+}
+
 void store_u16(std::byte* data, std::uint16_t value) noexcept {
     std::memcpy(data, &value, sizeof(value));
+}
+
+// Write a host-order numeric checksum in network byte order.
+void store_be16(std::byte* data, std::uint16_t value) noexcept {
+    store_u16(data, pe::bswap16_helper(value));
 }
 
 // ---------------------------------------------------------------------------
@@ -75,13 +86,12 @@ void store_u16(std::byte* data, std::uint16_t value) noexcept {
     std::uint32_t acc = 0;
     std::size_t i = 0;
     for (; i + 2 <= len; i += 2) {
-        std::uint16_t w;
-        std::memcpy(&w, data + i, sizeof(w));
-        acc += w;
+        acc += (static_cast<std::uint32_t>(static_cast<std::uint8_t>(data[i])) << 8) |
+               static_cast<std::uint8_t>(data[i + 1]);
     }
     if (i < len) {
-        std::uint8_t last = static_cast<std::uint8_t>(data[i]);
-        acc += static_cast<std::uint16_t>((last << 8)); // pad with zero low byte (per RFC 1071)
+        const auto last = static_cast<std::uint8_t>(data[i]);
+        acc += static_cast<std::uint32_t>(last) << 8; // pad with zero low byte (RFC 1071)
     }
     while (acc >> 16)
         acc = (acc & 0xFFFFu) + (acc >> 16);
@@ -102,37 +112,36 @@ void store_u16(std::byte* data, std::uint16_t value) noexcept {
 }
 
 // Reference L4 (TCP or UDP) checksum including the IPv4 pseudo-header.
-// All 16-bit words are interpreted in network byte order, matching the
-// engine's incremental-update convention.
+// The checksum field is zeroed at `csum_offset` (16 for TCP, 6 for UDP).
+// Returns the value in host byte order as read from the wire, which is what
+// the tests get from `load_u16()`.
 [[nodiscard]] std::uint16_t l4_csum_with_pseudo(const std::byte* ip, const std::byte* l4,
-                                                std::size_t l4_len) noexcept {
+                                                std::size_t l4_len,
+                                                std::size_t csum_offset = 16) noexcept {
     // Pseudo-header = src_ip (4) + dst_ip (4) + zero (1) + proto (1) + l4_len (2) = 12 bytes.
     std::uint32_t acc = 0;
-    // src_ip / dst_ip (read as big-endian u16s).
+    // src_ip / dst_ip (big-endian u16s).
     for (std::size_t i = 12; i < 20; i += 2) {
-        std::uint16_t w;
-        std::memcpy(&w, ip + i, sizeof(w));
-        acc += pe::bswap16_helper(w);
+        acc += (static_cast<std::uint32_t>(static_cast<std::uint8_t>(ip[i])) << 8) |
+               static_cast<std::uint8_t>(ip[i + 1]);
     }
-    // protocol = l4 segment byte at offset 9 of IPv4 header.
-    acc += pe::bswap16_helper(static_cast<std::uint16_t>(static_cast<std::uint8_t>(ip[9]) << 8));
-    // l4 length as u16.
-    acc += pe::bswap16_helper(static_cast<std::uint16_t>(l4_len));
+    // protocol: a 16-bit pseudo-header word with the protocol in the low byte.
+    acc += static_cast<std::uint8_t>(ip[9]);
+    // l4 length as a 16-bit big-endian word.
+    acc += static_cast<std::uint16_t>(l4_len);
 
     // L4 body with the checksum field zeroed.
     std::vector<std::byte> body(l4, l4 + l4_len);
-    std::uint16_t zero = 0;
-    std::memcpy(body.data() + 16, &zero, sizeof(zero));
+    body[csum_offset] = std::byte{0};
+    body[csum_offset + 1u] = std::byte{0};
 
     // Fold in the body.
     for (std::size_t i = 0; i + 1 < l4_len; i += 2) {
-        std::uint16_t w;
-        std::memcpy(&w, body.data() + i, sizeof(w));
-        acc += pe::bswap16_helper(w);
+        acc += (static_cast<std::uint32_t>(static_cast<std::uint8_t>(body[i])) << 8) |
+               static_cast<std::uint8_t>(body[i + 1]);
     }
     if ((l4_len & 1u) != 0u) {
-        acc += pe::bswap16_helper(
-            static_cast<std::uint16_t>(static_cast<std::uint8_t>(body[l4_len - 1]) << 8));
+        acc += static_cast<std::uint32_t>(static_cast<std::uint8_t>(body[l4_len - 1])) << 8;
     }
 
     while (acc >> 16)
@@ -187,16 +196,15 @@ struct Frame {
         ip[8] = std::byte{64};
         // protocol = 6 (TCP)
         ip[9] = std::byte{6};
-        // src_ip / dst_ip on the wire are just the `value` bytes copied as-is
-        // -- the existing parser convention is that IPv4Addr::value holds
-        // the on-wire byte pattern (big-endian bytes loaded straight into
-        // the u32 field).
-        std::memcpy(ip + 12, &src.value, 4);
-        std::memcpy(ip + 16, &dst.value, 4);
+        // src_ip / dst_ip on the wire are big-endian bytes.
+        for (std::size_t i = 0; i < 4; ++i) {
+            const auto shift = static_cast<unsigned>((3u - i) * 8u);
+            ip[12 + i] = std::byte{static_cast<std::uint8_t>(src.value >> shift)};
+            ip[16 + i] = std::byte{static_cast<std::uint8_t>(dst.value >> shift)};
+        }
 
         // header checksum (zero at this point)
-        const std::uint16_t hc = ipv4_header_csum(ip);
-        std::memcpy(ip + 10, &hc, 2);
+        store_be16(ip + 10, ipv4_header_csum(ip));
 
         // TCP segment.  Port bytes on the wire are BE; the engine reads
         // them via bswap16.
@@ -252,6 +260,8 @@ struct Frame {
         std::memcpy(udp, &sp_be, 2);
         std::memcpy(udp + 2, &dp_be, 2);
         std::memcpy(udp + 4, &len_be, 2);
+
+        store_be16(ip + 10, ipv4_header_csum(ip));
         return f;
     }
 
@@ -271,8 +281,8 @@ struct Frame {
         v.l4_total_length = l4_total_length;
         v.l4_csum_offset = static_cast<std::uint16_t>(l4_offset + 16u);
         // Fill src/dst IP+port from the wire (big-endian).
-        const std::uint32_t sbe = load_u32(bytes.data() + ip_offset + 12);
-        const std::uint32_t dbe = load_u32(bytes.data() + ip_offset + 16);
+        const std::uint32_t sbe = pe::bswap32_helper(load_u32(bytes.data() + ip_offset + 12));
+        const std::uint32_t dbe = pe::bswap32_helper(load_u32(bytes.data() + ip_offset + 16));
         v.src_ip = pe::IPv4Addr{sbe};
         v.dst_ip = pe::IPv4Addr{dbe};
         v.src_port = pe::bswap16_helper(load_u16(bytes.data() + l4_offset));
@@ -359,6 +369,55 @@ TEST(NatEngineTest, UdpForwardUsesUdpChecksumOffsetWithoutOutOfBounds) {
     EXPECT_EQ(packet->dst_port, 8080u);
 }
 
+TEST(NatEngineTest, UdpForwardRebuildsZeroChecksum) {
+    pe::ConntrackFlowCache flows;
+    pe::BackendRegistry reg;
+    register_backends(reg, {{1, "10.10.0.10:8080"}});
+    auto ket = make_ketama({{1, "10.10.0.10:8080"}});
+    pe::NatEngine engine{flows, reg, ket, kEngineVip};
+
+    // IPv4 UDP checksum zero means "not computed"; the NAT rewrite must
+    // synthesize the checksum for the original tuple before applying the
+    // incremental deltas.
+    Frame f = Frame::make_udp(pe::IPv4Addr{10, 0, 0, 1}, kEngineVip, 54321, 80);
+    ASSERT_EQ(f.bytes[f.l4_offset + 6u], std::byte{0});
+    ASSERT_EQ(f.bytes[f.l4_offset + 7u], std::byte{0});
+
+    auto packet = pe::parse_packet_mutable(f.bytes);
+    ASSERT_TRUE(packet.has_value());
+    ASSERT_EQ(engine.process_forward(*packet), pe::Action::TX_TO_BACKEND_INTERFACE);
+
+    const std::byte* ip = f.bytes.data() + f.ip_offset;
+    const std::byte* l4 = f.bytes.data() + f.l4_offset;
+    const std::uint16_t expected =
+        l4_csum_with_pseudo(ip, l4, f.l4_total_length, /*csum_offset=*/6);
+    const std::uint16_t actual = load_u16(l4 + 6);
+    EXPECT_EQ(actual, expected);
+    EXPECT_NE(actual, 0u) << "a synthesized UDP checksum must not be zero";
+}
+
+TEST(NatEngineTest, TcpForwardRebuildsZeroChecksumWithOddPayload) {
+    pe::ConntrackFlowCache flows;
+    pe::BackendRegistry reg;
+    register_backends(reg, {{1, "10.10.0.10:8080"}});
+    auto ket = make_ketama({{1, "10.10.0.10:8080"}});
+    pe::NatEngine engine{flows, reg, ket, kEngineVip};
+
+    const std::array<std::byte, 1> payload{std::byte{0x5a}};
+    Frame f = Frame::make_tcp(pe::IPv4Addr{10, 0, 0, 1}, kEngineVip, 54321, 80,
+                              std::span<const std::byte>{payload});
+    ASSERT_EQ(f.l4_total_length % 2u, 1u);
+
+    auto packet = pe::parse_packet_mutable(f.bytes);
+    ASSERT_TRUE(packet.has_value());
+    ASSERT_EQ(engine.process_forward(*packet), pe::Action::TX_TO_BACKEND_INTERFACE);
+
+    const std::byte* ip = f.bytes.data() + f.ip_offset;
+    const std::byte* l4 = f.bytes.data() + f.l4_offset;
+    const std::uint16_t expected = l4_csum_with_pseudo(ip, l4, f.l4_total_length);
+    EXPECT_EQ(load_u16(l4 + 16), expected);
+}
+
 TEST(NatEngineTest, ShortMutableUdpFrameDrops) {
     pe::ConntrackFlowCache flows;
     pe::BackendRegistry reg;
@@ -404,6 +463,19 @@ TEST(NatEngineTest, ForwardPicksBackendAndRewrites5Tuple) {
     std::memcpy(&wire_dp, f.bytes.data() + f.l4_offset + 2, 2);
     wire_dp = pe::bswap16_helper(wire_dp);
     EXPECT_EQ(wire_dp, 8080u);
+}
+
+TEST(NatEngineTest, ZeroBackendPortFailsClosed) {
+    pe::ConntrackFlowCache flows;
+    pe::BackendRegistry reg;
+    register_backends(reg, {{1, "10.10.0.10:0"}});
+    auto ket = make_ketama({{1, "10.10.0.10:0"}});
+    pe::NatEngine engine{flows, reg, ket, kEngineVip};
+
+    Frame frame = Frame::make_tcp(pe::IPv4Addr{10, 0, 0, 1}, kEngineVip, 54321, 80);
+    auto packet = frame.build_view();
+    EXPECT_EQ(engine.process_forward(packet), pe::Action::DROP);
+    EXPECT_EQ(flows.size(), 0u);
 }
 
 TEST(NatEngineTest, ExplicitBackendPinRejectsDegradedBackend) {
@@ -495,16 +567,10 @@ TEST(NatEngineTest, ForwardWritesCorrectIpv4HeaderChecksum) {
     std::byte ip_zero[20];
     std::memcpy(ip_zero, f.bytes.data() + f.ip_offset, 20);
     store_u16(ip_zero + 10, 0);
-    std::uint32_t acc = 0;
-    for (std::size_t i = 0; i < 20; i += 2) {
-        acc += load_u16(ip_zero + i);
-    }
-    while (acc >> 16)
-        acc = (acc & 0xFFFFu) + (acc >> 16);
-    const std::uint16_t reference_csum = static_cast<std::uint16_t>(~acc & 0xFFFFu);
+    const std::uint16_t reference_csum = ipv4_header_csum(ip_zero);
 
     // Read what the engine wrote back.
-    const std::uint16_t actual_csum = load_u16(f.bytes.data() + f.ip_offset + 10);
+    const std::uint16_t actual_csum = load_be16(f.bytes.data() + f.ip_offset + 10);
 
     EXPECT_EQ(actual_csum, reference_csum)
         << "incremental IPv4 csum mismatch: orig_src=" << std::hex << original_src_ip_be
@@ -628,7 +694,7 @@ TEST(NatEngineTest, ReturnReversePathUndoesForward) {
         std::byte* ip = f_ret.bytes.data() + f_ret.ip_offset;
         std::byte* l4 = f_ret.bytes.data() + f_ret.l4_offset;
         const std::uint16_t csum = l4_csum_with_pseudo(ip, l4, f_ret.l4_total_length);
-        std::memcpy(l4 + 16, &csum, 2);
+        store_u16(l4 + 16, csum);
     }
     auto ret_view = f_ret.build_view();
 
@@ -701,7 +767,7 @@ TEST(NatEngineTest, RoundTrip1000PairsZeroChecksumDrift) {
             std::byte* ip = f_ret.bytes.data() + f_ret.ip_offset;
             std::byte* l4 = f_ret.bytes.data() + f_ret.l4_offset;
             const std::uint16_t csum = l4_csum_with_pseudo(ip, l4, f_ret.l4_total_length);
-            std::memcpy(l4 + 16, &csum, 2);
+            store_u16(l4 + 16, csum);
         }
         auto ret_view = f_ret.build_view();
         ASSERT_EQ(engine.process_return(ret_view), pe::Action::TX_TO_CLIENT_INTERFACE);
@@ -712,15 +778,8 @@ TEST(NatEngineTest, RoundTrip1000PairsZeroChecksumDrift) {
             std::byte ip_zero[20];
             std::memcpy(ip_zero, ip, 20);
             store_u16(ip_zero + 10, 0);
-            std::uint32_t acc = 0;
-            for (std::size_t j = 0; j < 20; j += 2) {
-                acc += load_u16(ip_zero + j);
-            }
-            while (acc >> 16)
-                acc = (acc & 0xFFFFu) + (acc >> 16);
-            const std::uint16_t ref_csum = static_cast<std::uint16_t>(~acc & 0xFFFFu);
-            std::uint16_t actual_csum;
-            std::memcpy(&actual_csum, ip + 10, 2);
+            const std::uint16_t ref_csum = ipv4_header_csum(ip_zero);
+            const std::uint16_t actual_csum = load_be16(ip + 10);
             if (actual_csum != ref_csum)
                 ++ip_chk_mismatches;
         }
@@ -770,7 +829,7 @@ TEST(NatEngineTest, ProcessDispatcherPicksForwardOrReturnCorrectly) {
         std::byte* ip = f_ret.bytes.data() + f_ret.ip_offset;
         std::byte* l4 = f_ret.bytes.data() + f_ret.l4_offset;
         const std::uint16_t csum = l4_csum_with_pseudo(ip, l4, f_ret.l4_total_length);
-        std::memcpy(l4 + 16, &csum, 2);
+        store_u16(l4 + 16, csum);
     }
     auto ret = f_ret.build_view();
     EXPECT_EQ(engine.process(ret), pe::Action::TX_TO_CLIENT_INTERFACE);

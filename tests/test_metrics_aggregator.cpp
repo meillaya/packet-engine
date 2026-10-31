@@ -15,6 +15,13 @@ class MetricsAggregatorTest : public ::testing::Test {
     MetricsRegistry registry_;
 };
 
+TEST(MetricsLayoutTest, WorkerCountersIsTwoCacheLines) {
+    // rx, drops, tx, ten latency buckets, observations, and sum = 15 atomics.
+    // 120 bytes plus padding must be two 64-byte cache lines, not three.
+    EXPECT_EQ(sizeof(WorkerCounters), 128u);
+    EXPECT_EQ(alignof(WorkerCounters), 64u);
+}
+
 TEST_F(MetricsAggregatorTest, AggregateRxCounters) {
     MetricsAggregator agg(2, &registry_);
 

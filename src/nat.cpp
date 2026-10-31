@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <string_view>
 
 #include "packet-engine/conntrack.hpp"
 #include "packet-engine/ketama.hpp"
@@ -161,7 +162,14 @@ inline void write_be16(std::byte* dst, std::uint16_t v_host) noexcept {
 
 // From-scratch L4 checksum over an IPv4 pseudo-header plus the L4 segment.
 // The checksum field inside `l4` is assumed to be zero.  The returned value
-// is in the same on-wire convention the incremental helpers consume.
+// is byte-swapped relative to the numeric checksum, which is what the
+// incremental helpers below expect from `read_be16()`.
+//
+// The parse path uses host-order numeric words, so this helper sums the
+// little-endian byte pairs (the byte-swap of each big-endian word).  Two
+// fields are single 16-bit values rather than byte pairs: the pseudo-header
+// length must be byte-swapped before it is added, and an odd trailing byte
+// is the byte-swapped form of `byte << 8`, which is just `byte`.
 [[nodiscard]] inline std::uint16_t l4_csum_from_scratch(const std::byte* ip, const std::byte* l4,
                                                         std::uint16_t l4_len) noexcept {
     std::uint32_t acc = 0;
@@ -170,12 +178,12 @@ inline void write_be16(std::byte* dst, std::uint16_t v_host) noexcept {
                (static_cast<std::uint8_t>(ip[12 + i + 1]) << 8);
     }
     acc += static_cast<std::uint16_t>(static_cast<std::uint8_t>(ip[9]) << 8);
-    acc += l4_len;
+    acc += bswap16(l4_len);
     for (std::uint16_t i = 0; i + 1 < l4_len; i += 2) {
         acc += static_cast<std::uint8_t>(l4[i]) | (static_cast<std::uint8_t>(l4[i + 1]) << 8);
     }
     if ((l4_len & 1u) != 0u) {
-        acc += static_cast<std::uint16_t>(static_cast<std::uint8_t>(l4[l4_len - 1]) << 8);
+        acc += static_cast<std::uint16_t>(static_cast<std::uint8_t>(l4[l4_len - 1]));
     }
     while (acc >> 16)
         acc = (acc & 0xFFFFu) + (acc >> 16);
@@ -232,8 +240,9 @@ inline void write_be16(std::byte* dst, std::uint16_t v_host) noexcept {
             return false;
         any_port = true;
     }
-    if (!any_port)
+    if (!any_port || port_acc == 0) {
         return false;
+    }
     port_h = static_cast<std::uint16_t>(port_acc);
     return true;
 }

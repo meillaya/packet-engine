@@ -126,7 +126,10 @@ using json = nlohmann::json;
     if (!prefix || *prefix > 32) {
         return std::unexpected(ParseError{"invalid CIDR prefix length"});
     }
-    return Cidr{*addr, static_cast<std::uint8_t>(*prefix)};
+    // Clear host bits so GET /rules returns the same prefix the trie stores.
+    const std::uint32_t mask =
+        *prefix == 0 ? 0u : static_cast<std::uint32_t>(~0u << (32u - *prefix));
+    return Cidr{IPv4Addr{addr->value & mask}, static_cast<std::uint8_t>(*prefix)};
 }
 
 [[nodiscard]] std::string cidr_to_string(const Cidr& cidr) {

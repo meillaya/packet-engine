@@ -201,7 +201,15 @@ template <typename Addr, typename V = std::uint32_t, std::size_t MAX_NODES = 819
 
         // Prune leaf chains that no longer hold any value and have no children.
         if (nodes_[node].child[0] == 0 && nodes_[node].child[1] == 0) {
+            const bool target_is_root = (node == root_);
             release_node(node);
+            if (target_is_root) {
+                // A /0 prefix lives on the root node.  Releasing it without
+                // clearing `root_` leaves the trie pointing at a freed node,
+                // which the free list can hand out again on the next insert.
+                root_ = 0;
+                return true;
+            }
             while (path_len > 1) {
                 const std::uint32_t parent = path[path_len - 1];
                 const std::uint8_t b = bits[path_len - 1];

@@ -89,10 +89,10 @@ namespace packet_engine {
 //
 // CAPACITY must be a power of two and at least 16 (the kMaxProbe
 // budget).  Common values: 65536 (2^16, ~10k entries at load 0.16)
-// or 4M (2^22) for the production rule store.
+// or 4M (2^22) for a larger store.
 //
-// Performance is acceptable up to load factor ~0.9; beyond that the
-// table is treated as full and insert returns false.
+// The table treats the load-factor cap as full; insert returns false
+// after that point rather than growing.
 //
 template <typename K, typename V, std::size_t CAPACITY> class OpenAddrHashTable {
   public:
@@ -110,7 +110,7 @@ template <typename K, typename V, std::size_t CAPACITY> class OpenAddrHashTable 
     static constexpr size_type kLoadFactorCap = CAPACITY / 2;
     static constexpr size_type kMaxSize = (kLoadFactorCap == 0) ? 1 : kLoadFactorCap;
 
-    static_assert(CAPACITY >= 16, "CAPACITY must be >= 16 to hold at least one probe run");
+    static_assert(CAPACITY >= 16, "CAPACITY must be >= 16 to hold one probe run");
     static_assert((CAPACITY & (CAPACITY - 1)) == 0, "CAPACITY must be a power of two");
 
     OpenAddrHashTable() noexcept = default;
@@ -163,6 +163,12 @@ template <typename K, typename V, std::size_t CAPACITY> class OpenAddrHashTable 
     // saturated).
     // -------------------------------------------------------------------
     [[nodiscard]] bool insert(const K& key, const V& value) noexcept {
+        // An existing key is an update, not an insertion.  Check it before
+        // the load-factor guard so a full table can still refresh a value.
+        if (V* existing = find(key); existing != nullptr) {
+            *existing = value;
+            return true;
+        }
         // Hard cap: at this load factor kMaxProbe cannot keep every
         // key inside the probe budget, so the caller is told to back
         // off and grow the table instead.  rebuild() cannot shrink

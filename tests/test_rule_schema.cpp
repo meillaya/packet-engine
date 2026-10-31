@@ -66,6 +66,17 @@ TEST(RuleSchemaTest, RoundTripForwardCidrRule) {
     EXPECT_EQ((*parsed)[0], original);
 }
 
+TEST(RuleSchemaTest, CidrHostBitsAreNormalized) {
+    const std::string json = R"([{"id":"net","action":"DROP","cidr":"10.1.2.3/8"}])";
+    const auto parsed = pe::parse_rules_json(json);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_EQ(parsed->size(), 1U);
+    ASSERT_TRUE((*parsed)[0].cidr.has_value());
+    EXPECT_EQ((*parsed)[0].cidr->addr, (pe::IPv4Addr{10, 0, 0, 0}));
+    EXPECT_EQ((*parsed)[0].cidr->prefix_len, 8u);
+    EXPECT_NE(pe::serialize_rules_json(*parsed).find(R"("10.0.0.0/8")"), std::string::npos);
+}
+
 TEST(RuleSchemaTest, RoundTripRateLimitRule) {
     const auto original = make_rate_limit_rule();
     const std::string json = pe::serialize_rules_json({original});

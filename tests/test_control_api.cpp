@@ -329,6 +329,19 @@ TEST_F(ControlApiTest, DuplicateCidrMatchersAreRejected) {
               std::string::npos);
 }
 
+TEST_F(ControlApiTest, RuleValidationErrorIsValidJson) {
+    // The unknown action contains a quote; the error response must escape it
+    // instead of splicing the raw parser message into the JSON body.
+    const char* body = R"([{"id":"1","action":"BAD\"","cidr":"10.0.0.0/8"}])";
+    const auto response = http_request("/rules", "PUT", body, api_.socket_path());
+    const auto separator = response.find("\r\n\r\n");
+    ASSERT_NE(separator, std::string::npos);
+    const auto document = nlohmann::json::parse(response.substr(separator + 4), nullptr, false);
+    ASSERT_FALSE(document.is_discarded());
+    ASSERT_TRUE(document.contains("error"));
+    EXPECT_NE(document.at("error").get<std::string>().find("BAD\""), std::string::npos);
+}
+
 TEST_F(ControlApiTest, PutBackendsAtomicallyReplacesRegistryAndKetama) {
     const char* first =
         R"([{"id":1,"authority":"10.0.0.11:8080","health_port":9080},{"id":2,"authority":"10.0.0.12:8080","health_port":9081}])";

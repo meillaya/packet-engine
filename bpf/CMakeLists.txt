@@ -83,6 +83,17 @@ set(BPF_CFLAGS
   -fno-stack-protector
 )
 
+# Debian and Ubuntu keep <asm/types.h> in the architecture-specific include
+# directory, which clang does not add implicitly for a -target bpf compile.
+find_path(ASM_TYPES_INCLUDE_DIR
+  NAMES asm/types.h
+  PATHS /usr/include/${CMAKE_LIBRARY_ARCHITECTURE}
+  NO_DEFAULT_PATH
+)
+if(ASM_TYPES_INCLUDE_DIR)
+  list(APPEND BPF_CFLAGS -I${ASM_TYPES_INCLUDE_DIR})
+endif()
+
 # -----------------------------------------------------------------------------
 # af_xdp_kern.o  --  AF_XDP redirect XDP program
 # -----------------------------------------------------------------------------
