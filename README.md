@@ -3,165 +3,123 @@
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?style=flat&logo=c%2B%2B&logoColor=white)](https://en.cppreference.com/w/cpp/23)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-FCC624?style=flat&logo=linux&logoColor=black)](https://www.kernel.org/)
 
-A C++23 userspace packet-processing engine for Linux with AF_XDP and optional
-DPDK poll-mode I/O. It combines bounded RX/TX loops, zero-allocation packet
-parsing, live firewall policy, byte-rate limiting, consistent hashing, IPv4
-L4 NAT/conntrack, and Prometheus metrics.
+A userspace packet processor for Linux. It receives frames through AF_XDP or
+DPDK, parses them in place, applies an IPv4 policy table, optionally rewrites
+them for L4 NAT and load balancing, and transmits them from one
+run-to-completion polling thread.
 
 This is a research and portfolio implementation, not a production firewall or
-load balancer. Capability and benchmark claims below intentionally distinguish
-what is implemented from what was proved on this host.
+load balancer. The tables below separate what the code implements from what was
+exercised on this host.
 
-## Status and scope
+## What runs
 
-| Area | Implemented behavior | Evidence boundary |
+| Area | Behavior | Evidence |
 |---|---|---|
-| AF_XDP | UMEM RX/TX, FILL/CQ recycling, custom XDP redirect program, actual-mode query | Requires a suitable interface, BPF/network capabilities, and memlock. Startup reports `mode=copy`, `mode=zero-copy`, or `mode=unknown`; only `zero-copy` is proof of AF_XDP zero-copy mode. |
-| DPDK | EAL/ethdev initialization, one RX/TX queue, mbuf ownership and cleanup, bounded runtime | `net_pcap` is tested unprivileged. `net_af_packet` is a privileged, copy-backed veth demo. Neither proves PCI PMD kernel bypass or zero-copy. |
-| Parser | Ethernet II, one VLAN tag, IPv4, IPv6 extension walk, TCP, UDP, ICMPv4; ICMPv6 classification; IPv4 and transport checksum validation | IPv4 TCP/UDP fragments fail closed. IPv4 UDP checksum zero is accepted by protocol; IPv6 UDP checksum zero is rejected. IPv6 is parsed, but live rule lookup and NAT are currently IPv4-only. |
-| Policy | Exact IPv4 five-tuple, IPv4 CIDR longest-prefix match, `ALLOW`, `DROP`, `RATE_LIMIT`, `FORWARD` | Rule tables are built off-path and atomically swapped. `RATE_LIMIT` admits unchanged packets while tokens remain and drops after exhaustion. |
-| L4 LB/NAT | Ketama consistent hashing, optional explicit backend pinning, backend health probing, conntrack, one-arm Ethernet next-hop rewrite, and in-place TCP/UDP checksum-safe IPv4 NAT | Enabled with `--vip`. A `FORWARD` rule without a usable backend, next-hop MAC, or NAT path fails closed. |
-| Observability | RX, TX, drop counters and a Prometheus latency histogram | Histogram observations are batch processing durations in the current executable, not wire RTT. |
-| Concurrency primitives | Cache-aligned descriptors, SPSC rings, NUMA topology/worker and frame-allocation components | The current executable is one queue and one run-to-completion polling thread. The tested worker/SPSC components are not presented as active multi-core runtime scaling. |
+| AF_XDP | UMEM RX/TX, FILL and completion recycling, an owned XDP redirect program, and a `getsockopt` mode query. | Needs an interface, BPF and network capabilities, and memlock. Startup prints `mode=copy`, `mode=zero-copy`, or `mode=unknown`. Only `zero-copy` proves zero-copy. |
+| DPDK | EAL and ethdev setup, one RX/TX queue, mbuf ownership, and bounded shutdown. | `net_pcap` is tested without privileges. `net_af_packet` is a privileged, copy-backed veth demo. Neither proves PCI kernel bypass or zero-copy. |
+| Parser | Ethernet II, one VLAN tag, IPv4, an IPv6 extension walk, TCP, UDP, ICMPv4, ICMPv6 classification, and checksum validation. | IPv4 TCP/UDP fragments fail closed. IPv4 UDP checksum zero is accepted; IPv6 UDP checksum zero is rejected. Policy lookup and NAT are IPv4 only. |
+| Policy | Exact IPv4 five-tuple, IPv4 CIDR longest-prefix match, and four actions. | Tables are built off-path and swapped atomically. `RATE_LIMIT` transmits while tokens remain and drops after exhaustion. |
+| L4 LB and NAT | Ketama hashing, optional backend pinning, health probing, conntrack, one-arm Ethernet rewrite, and in-place TCP/UDP checksum updates. | Enabled with `--vip`. A `FORWARD` rule without a usable VIP path, backend, or next-hop MAC fails closed. |
+| Observability | RX, TX, and drop counters plus a batch-duration histogram. | Histogram values are batch processing times in the executable, not wire RTT. |
+| Concurrency | Cache-aligned descriptors, SPSC rings, NUMA topology, worker and frame-allocation components. | The executable runs one queue on one polling thread. The tested worker and SPSC components are not presented as multi-core scaling. |
 
-Kubernetes CNI integration is deliberately outside v1. A future demo could
-expose this engine as a Multus secondary network, but this repository does not
-install, configure, or claim a CNI plugin.
+Kubernetes CNI integration is outside this version. A future demo could expose
+the engine as a Multus secondary network. This repository does not install,
+configure, or claim a CNI plugin.
 
-## Runtime architecture
+## Packet path
 
-```mermaid
-flowchart TB
-    %% packet-engine runtime architecture
-    %% Single run-to-completion polling thread + control-plane jthread.
+![Data path: one polling thread carries a batch from RX through parse, policy, and NAT to TX](docs/figures/datapath.png)
 
-    %% ────────────────────────────────────────────────────────────────
-    %% Dataplane: RX
-    %% ────────────────────────────────────────────────────────────────
-    subgraph RX["RX sources"]
-        direction LR
-        AF["AF_XDP UMEM<br/>veth · NIC · queue 0"]:::rx
-        DP["DPDK ethdev queue 0<br/>net_pcap · net_af_packet"]:::rx
-        RECV["recv_batch<br/>PacketDescriptor × &le; 64"]:::rx
-        AF --> RECV
-        DP --> RECV
-    end
+Both backends present frames as descriptors. AF_XDP uses offsets into a
+4096-frame UMEM; DPDK uses mbufs. The loop takes at most 64 frames per batch and
+processes them on the thread that received them.
 
-    %% ────────────────────────────────────────────────────────────────
-    %% Dataplane: per-packet processing
-    %% ────────────────────────────────────────────────────────────────
-    subgraph PROC["Per-packet processing"]
-        direction TB
-        SNAP(("rules_snapshot<br/>atomic shared_ptr load")):::snap
-        PARSE["parse_packet<br/>Ethernet II + VLAN tag<br/>IPv4 · IPv6 ext hdr walk<br/>TCP · UDP · ICMPv4 · ICMPv6<br/>zero-copy std::span views"]:::parse
-        V4CHKV4{"IPv4 ?"}:::dec
-        NATELIG{"NAT eligible ?<br/>IPv4 AND TCP/UDP AND --vip"}:::dec
-        MUT["Build MutablePacket<br/>l3 / l4 offsets · csum offsets<br/>TCP flags"]:::nat
-        EXIST["NatEngine::process_existing<br/>conntrack return-path<br/>swapped 5-tuple lookup"]:::nat
-        HIT1(("return-path hit")):::snap
-        LOOK["RuleTable::lookup_entry<br/>exact 5-tuple first<br/>then IPv4 CIDR LPM<br/>RATE_LIMIT token bucket"]:::rule
-        ACT{"action"}:::dec
-        FWDELIG{"FORWARD AND<br/>NAT eligible ?"}:::dec
-        FWD["NatEngine::process_forward<br/>Ketama pick on original tuple<br/>ephemeral-port alloc<br/>flows_.try_lookup_or_create<br/>in-place IPv4 L3 + L4 rewrite<br/>incremental csum (RFC 1624)"]:::nat
-        DEF["default_action<br/>DROP unless --default-action=allow"]:::snap
+`parse_packet` builds spans into the original frame. Nothing copies or
+allocates before a rule match. IPv4 packets go through `lookup_entry`: exact
+five-tuple first, then longest-prefix CIDR on the destination address. Non-IPv4
+traffic takes the default action.
 
-        RECV --> SNAP --> PARSE --> V4CHKV4
-        V4CHKV4 -- "no (IPv6)" --> DEF
-        V4CHKV4 -- "yes" --> NATELIG
-        NATELIG -- "no" --> LOOK
-        NATELIG -- "yes" --> MUT --> EXIST
-        EXIST -- "hit" --> HIT1
-        EXIST -- "miss" --> LOOK
-        LOOK --> ACT
-        ACT -- "ALLOW" --> TXOK(("forward")):::snap
-        ACT -- "RATE_LIMIT<br/>(tokens)" --> TXOK
-        ACT -- "DROP" --> DROP(("drop")):::drop
-        ACT -- "FORWARD_TO_BACKEND" --> FWDELIG
-        FWDELIG -- "no · fail-closed" --> DROP
-        FWDELIG -- "yes" --> FWD
-        FWD -- "TX_TO_BACKEND_INTERFACE" --> TXOK
-        FWD -- "DROP · fail-closed" --> DROP
-        DEF -- "ALLOW" --> TXOK
-        DEF -- "DROP" --> DROP
-    end
+`ALLOW` and `RATE_LIMIT` transmit the frame unchanged. A matched `FORWARD` rule
+goes through the NAT engine before transmission. Dropped and rejected frames
+return to the backend only after the transmit call reports which descriptors it
+accepted. AF_XDP frames follow RX ownership through TX completion back to the
+FILL ring. DPDK transfers an mbuf to the PMD only when a TX burst accepts it.
 
-    %% ────────────────────────────────────────────────────────────────
-    %% Dataplane: TX + ownership lifecycle
-    %% ────────────────────────────────────────────────────────────────
-    subgraph TX["TX (TransmitBatch)"]
-        direction TB
-        FB["forward<br/>transmit_descriptors"]:::tx
-        DB["drop<br/>recycle_addresses (AF_XDP)<br/>or mbuf ledger (DPDK)"]:::tx
-        SEND["backend.send_batch<br/>accepted = N"]:::tx
-        KIND{"backend ?"}:::dec
-        RX_REC["recycle_rx_addresses<br/>ACKed frames → UMEM FILL"]:::tx
-        CPL["recycle_completions<br/>drain TX completion CQ"]:::tx
-        FILL["service_fill_ring<br/>refill FILL ring"]:::tx
-        REL["release_pending<br/>DPDK mbufs not accepted"]:::tx
+## Forwarding decisions
 
-        HIT1 --> FB
-        TXOK --> FB --> SEND
-        DROP --> DB --> REL
-        SEND --> KIND
-        KIND -- "AF_XDP" --> RX_REC --> CPL --> FILL
-        KIND -- "DPDK" --> REL
-    end
+![Forwarding: a FORWARD rule drops unless NAT eligibility, a backend, and a next-hop MAC resolve](docs/figures/forwarding.png)
 
-    %% ────────────────────────────────────────────────────────────────
-    %% Dataplane: metrics
-    %% ────────────────────────────────────────────────────────────────
-    MET["record_rx · record_tx · record_drop · record_latency_us<br/>MetricsEndpoint over TCP :metrics_port<br/>Prometheus text format"]:::metrics
-    SEND --> MET
+| Action | Behavior |
+|---|---|
+| `ALLOW` | Transmit unchanged. |
+| `DROP` | Return the frame to the recycle path. |
+| `RATE_LIMIT` | Transmit while the byte bucket has tokens; drop after exhaustion. |
+| `FORWARD` | Rewrite to a backend and transmit on the backend interface. |
 
-    %% ────────────────────────────────────────────────────────────────
-    %% Control plane (separate jthread)
-    %% ────────────────────────────────────────────────────────────────
-    subgraph CTL["Control plane (ControlApi · jthread)"]
-        direction TB
-        SOCK["AF_UNIX :control-socket<br/>HTTP/1.1 subset<br/>recv ≤ 64 KiB · 500 ms deadline"]:::ctl
-        RGET["GET /health · /rules"]:::ctl
-        RPUT["PUT /rules<br/>parse + validate<br/>build RuleTable off-path<br/>atomic shared_ptr swap"]:::ctl
-        BGET["GET /backends"]:::ctl
-        BPUT["PUT /backends<br/>parse + validate<br/>atomic replace<br/>BackendRegistry + Ketama ring"]:::ctl
+A `FORWARD` rule needs `--vip`, an IPv4 TCP or UDP flow, a backend selected by
+`backend_id` or the Ketama ring, a non-zero next-hop MAC, and a free ephemeral
+port in the range 32768 to 60999. A miss on any of those checks drops the
+packet. The forward path rewrites the IPv4 addresses, the L4 ports, both
+checksums, and both Ethernet addresses in place. Incremental checksum updates
+follow RFC 1624.
 
-        SOCK --> RGET
-        SOCK --> RPUT
-        SOCK --> BGET
-        SOCK --> BPUT
-    end
+The forward path creates a conntrack entry keyed by the original five-tuple and
+a translated alias. Return traffic matches the swapped tuple before policy
+lookup and is rewritten back to the client. Existing flows keep their backend
+when a rule set or ring is replaced. The idle timeout is 120 seconds.
 
-    RPUT -. "atomic publish" .-> SNAP
-    BPUT -. "atomic swap" .-> FWD
+The unmatched default is `DROP` unless `--default-action=allow` is set.
+Malformed packets always fail closed.
 
-    %% ────────────────────────────────────────────────────────────────
-    %% Styles
-    %% ────────────────────────────────────────────────────────────────
-    classDef rx fill:#dbeafe,stroke:#1d4ed8,color:#0c1f5e
-    classDef parse fill:#ede9fe,stroke:#6d28d9,color:#2e1065
-    classDef rule fill:#fef3c7,stroke:#b45309,color:#451a03
-    classDef nat fill:#fce7f3,stroke:#be185d,color:#500724
-    classDef tx fill:#dcfce7,stroke:#15803d,color:#052e16
-    classDef drop fill:#fee2e2,stroke:#b91c1c,color:#450a0a
-    classDef metrics fill:#cffafe,stroke:#0e7490,color:#083344
-    classDef snap fill:#f1f5f9,stroke:#475569,color:#0f172a
-    classDef dec fill:#fff7ed,stroke:#c2410c,color:#431407
-    classDef ctl fill:#fef9c3,stroke:#a16207,color:#422006
-```
+## Control plane
 
-Packet bytes are viewed through spans and NAT rewrites in place. AF_XDP frames
-follow RX ownership through TX completion back to FILL; DPDK mbufs transfer to
-the PMD only when a TX burst accepts them. Rejected or dropped descriptors
-remain application-owned until they are explicitly released.
+![Control plane: rule and backend updates build immutable snapshots and publish them atomically](docs/figures/control-plane.png)
+
+The control API is an HTTP/1.1 subset over an `AF_UNIX` socket. One `jthread`
+accepts connections serially. Requests are capped at 64 KiB, a client has 500 ms
+to finish, and the listener only unlinks a socket it still owns. A live socket
+belongs to its owner; a stale one is replaced.
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/health` | `{"status":"ok"}` |
+| `GET` | `/rules` | Canonical rule array |
+| `PUT` | `/rules` | Validate a complete replacement, build a new `RuleTable`, publish it |
+| `GET` | `/backends` | Backend array, sorted by id |
+| `PUT` | `/backends` | Validate and replace the registry and Ketama ring |
+| any | other | `404` |
+
+`PUT /rules` parses the body, validates every rule, builds the new table off
+the data path, and swaps one `std::atomic<std::shared_ptr<const RuleTable>>`.
+The polling thread takes one acquire load per batch. Readers see the old table
+or the new table, never a partial one. An invalid replacement leaves the
+current table active.
+
+`PUT /backends` replaces the whole registry. The registry rebuilds the Ketama
+ring from healthy backends, with 160 continuum points per backend. An invalid
+replacement leaves the current registry and ring active. Existing conntrack
+entries remain mutable dataplane state; replacement does not clear them.
+
+The active health prober opens a non-blocking TCP connection to each backend's
+`health_port` every 5 seconds, with a 1 second timeout. More than three failures
+inside 10 seconds demote a backend from `HEALTHY` to `DEGRADED`, and the ring
+drops it from new flow selection. A successful probe restores the backend.
 
 ## Build and test
 
-Use the Nix development shell or provide CMake 3.25+, Ninja, a C++23 compiler,
-libxdp/libbpf, Boost headers, nlohmann-json, GoogleTest, and optionally
-libnuma/DPDK.
+The Nix shell provides CMake 3.25 or newer, Ninja, a C++23 compiler, libxdp,
+libbpf, Boost headers, nlohmann-json, GoogleTest, DPDK, libnuma, and
+xdp-tools:
 
 ```sh
 nix develop
+```
 
+Without Nix, install those dependencies and use a C++23 compiler.
+
+```sh
 # AF_XDP-enabled default build
 cmake -S . -B build -G Ninja
 cmake --build build -j
@@ -171,23 +129,31 @@ ctest --test-dir build --output-on-failure
 cmake -S . -B build-dpdk -G Ninja -DENABLE_DPDK=ON
 cmake --build build-dpdk -j
 ctest --test-dir build-dpdk --output-on-failure
+```
 
-# Quality gates
+Each `tests/test_*.cpp` becomes one GoogleTest executable. DPDK-enabled builds
+also register the PCAP integration and benchmark scripts with CTest.
+
+`./scripts/build.sh -DENABLE_DPDK=ON` is a convenience wrapper, but it always
+uses `build/`. Use separate CMake directories when comparing configurations.
+AddressSanitizer and UndefinedBehaviorSanitizer builds use `-DENABLE_ASAN=ON`
+and `-DENABLE_UBSAN=ON`.
+
+Quality gates:
+
+```sh
 cmake --build build --target format-check
 cmake --build build --target shellcheck
 cmake --build build --target clang-tidy
 ```
 
-`./scripts/build.sh -DENABLE_DPDK=ON` is a convenience wrapper, but it always
-uses `build/`; use separate CMake directories when comparing configurations.
-AddressSanitizer and UndefinedBehaviorSanitizer builds use `-DENABLE_ASAN=ON`
-and `-DENABLE_UBSAN=ON` respectively.
+## Running it
 
-## Unprivileged DPDK PCAP quickstart
+### Unprivileged DPDK PCAP replay
 
 The deterministic integration path uses DPDK's file-backed `net_pcap` PMD. It
-executes the real engine RX/parser/policy/TX loop and terminates after the input
-packet count. It does not require root, a veth pair, hugepages, or PCI binding.
+runs the real RX, parser, policy, and TX loop and stops after the input packet
+count. It needs no root, veth pair, hugepages, or PCI binding.
 
 ```sh
 cmake -S . -B build-dpdk -G Ninja -DENABLE_DPDK=ON
@@ -218,14 +184,14 @@ build-dpdk/packet-engine \
 ```
 
 `net_pcap` copies between PCAP records and DPDK mbufs. This path proves real
-DPDK poll-mode software-PMD I/O and engine composition, not zero-copy or native
-NIC performance.
+DPDK poll-mode software-PMD I/O and engine composition. It does not measure
+zero-copy or native NIC performance.
 
-## AF_XDP quickstart and mode proof
+### AF_XDP
 
 A live AF_XDP run needs an existing interface and normally `CAP_NET_ADMIN`,
-`CAP_BPF`/`CAP_SYS_ADMIN` as required by the host kernel, plus an adequate
-`RLIMIT_MEMLOCK`. The engine owns XDP program loading and detachment; do not
+`CAP_BPF` or `CAP_SYS_ADMIN` as the host kernel requires, plus enough
+`RLIMIT_MEMLOCK`. The engine loads and detaches its own XDP program; do not
 preload a second redirect program with `xdp-loader`.
 
 ```sh
@@ -238,7 +204,7 @@ sudo -E build/packet-engine \
   --metrics-port=9090
 ```
 
-On successful initialization stdout includes one of:
+A successful start prints one of these lines:
 
 ```text
 capability backend=af_xdp interface=veth0 queue=0 mode=zero-copy
@@ -247,15 +213,15 @@ capability backend=af_xdp interface=veth0 queue=0 mode=unknown
 ```
 
 The value comes from `getsockopt(SOL_XDP, XDP_OPTIONS)`. A successful socket or
-an AF_XDP label alone is not a zero-copy claim. The veth path is expected to be
-copy mode; a physical NIC/driver test is required to prove zero-copy.
+an AF_XDP label alone is not a zero-copy result. The veth path is expected to be
+copy mode. A physical NIC and driver test is required to prove zero-copy.
 
 `scripts/dev-run.sh shell` creates a root-required veth pair and removes only
 the pair it created. `bench/run_engine_bench.sh` is the capability-gated live
-AF_XDP/tcpreplay harness. Every script tracks its children and terminates them
-from `EXIT`, `INT`, and `TERM` cleanup paths.
+AF_XDP and tcpreplay harness. Both harnesses track their children and
+terminate them from `EXIT`, `INT`, and `TERM` cleanup paths.
 
-## DPDK AF_PACKET veth demo
+### DPDK AF_PACKET veth demo
 
 When the installed DPDK includes `net_af_packet`, the same one-queue runtime can
 poll a veth interface:
@@ -272,9 +238,10 @@ sudo -E build-dpdk/packet-engine \
   --vdev=net_af_packet0,iface=veth0,qpairs=1,qdisc_bypass=1
 ```
 
-This requires `CAP_NET_RAW`; creating the veth pair requires `CAP_NET_ADMIN`.
-AF_PACKET uses kernel packet sockets/PACKET_MMAP and copies into DPDK mbufs, so
-it is not kernel bypass and not end-to-end zero-copy.
+This needs `CAP_NET_RAW`; creating the veth pair needs `CAP_NET_ADMIN`.
+AF_PACKET uses kernel packet sockets and PACKET_MMAP and copies into DPDK
+mbufs. This demo exercises the copy path through the kernel, not kernel
+bypass.
 
 ## CLI
 
@@ -282,36 +249,24 @@ it is not kernel bypass and not end-to-end zero-copy.
 --backend=af_xdp|dpdk    datapath backend (default: af_xdp)
 --interface=NAME         AF_XDP interface (default: veth0)
 --queue=N                queue id (default: 0; DPDK supports queue 0 only)
---dpdk-port=NAME         required named DPDK port/vdev
+--dpdk-port=NAME         required named DPDK port or vdev
 --max-packets=N          stop after N received packets
 --max-idle-ms=N          stop after N idle milliseconds
 --control-socket=PATH    Unix control socket
 --metrics-port=PORT      Prometheus TCP listen port
 --vip=IPv4               enable IPv4 L4 NAT for this virtual IP
 --default-action=ACTION  unmatched policy: drop|allow (default: drop)
---                       remaining arguments are passed to DPDK EAL
+--                       remaining arguments go to DPDK EAL
 ```
 
-SIGINT and SIGTERM request bounded loop shutdown. AF_XDP detaches its owned BPF
-link; DPDK stops/closes the port, frees application-owned mbufs and its mempool,
-and calls EAL cleanup.
+SIGINT and SIGTERM request a bounded loop shutdown. AF_XDP detaches its owned
+BPF link. DPDK stops and closes the port, frees application-owned mbufs and its
+mempool, and calls EAL cleanup.
 
-## Live rules control API
+## Rules and backends
 
-The API is an HTTP/1.1 subset over an AF_UNIX socket. It enforces bounded
-request sizes and client deadlines, and refuses to steal a socket path from a
-live owner.
-
-| Method and path | Behavior |
-|---|---|
-| `GET /health` | `{"status":"ok"}` |
-| `GET /rules` | Current canonical JSON array |
-| `PUT /rules` | Parse/validate a complete replacement, build a new table, and atomically publish it |
-| `GET /backends` | Current backend array, sorted by ID |
-| `PUT /backends` | Validate and atomically replace the backend registry and Ketama ring |
-| other | `404` |
-
-Example rule set:
+A rule matches by exactly one of `tuple` or `cidr`. Rule ids and rule
+`backend_id` values are decimal unsigned strings.
 
 ```json
 [
@@ -347,13 +302,13 @@ Example rule set:
 ]
 ```
 
-Although the field retains the historical name `rate_bps`, its implemented
-unit is **bytes per second**; `burst_bytes` is bytes. Rule IDs and rule
-`backend_id` values must be decimal unsigned strings. For `FORWARD`, omit
-`backend_id` to select a healthy backend with Ketama consistent hashing, or set
-it to pin new flows to one backend. Existing flows retain their selected
-backend across rule and ring updates. `FORWARD` also requires `--vip` and at
-least one usable registered backend; otherwise packets fail closed.
+The field name `rate_bps` is historical. Its unit is bytes per second.
+`burst_bytes` is bytes. A `RATE_LIMIT` rule requires both fields with non-zero
+values.
+
+For `FORWARD`, omit `backend_id` to hash new flows across healthy backends with
+Ketama, or set it to pin new flows to one backend. A pinned backend must be
+healthy. `FORWARD` also requires `--vip`; otherwise packets fail closed.
 
 ```sh
 curl --unix-socket /tmp/packet-engine.sock \
@@ -364,12 +319,11 @@ curl --unix-socket /tmp/packet-engine.sock http://localhost/rules
 curl --unix-socket /tmp/packet-engine.sock http://localhost/health
 ```
 
-A backend update is a complete replacement. Each object must contain `id`
-(unsigned integer below `4294967295`), a unique non-empty `authority`, and
-`health_port` (unsigned 16-bit integer). The optional `mac` field is a non-zero
-Ethernet address; it is required for `FORWARD` traffic so the one-arm dataplane
-can rewrite the next hop. NAT expects an IPv4 `authority` in `address:port`
-form:
+A backend update is a complete replacement. Each object needs a unique `id`
+below `4294967295`, a unique non-empty `authority`, and a `health_port` in the
+unsigned 16-bit range. The optional `mac` is a non-zero Ethernet address and is
+required for `FORWARD` traffic. NAT expects an IPv4 `authority` in
+`address:port` form.
 
 ```json
 [
@@ -385,16 +339,12 @@ curl --unix-socket /tmp/packet-engine.sock \
 curl --unix-socket /tmp/packet-engine.sock http://localhost/backends
 ```
 
-Invalid replacement arrays leave the prior registry/ring active. Existing
-conntrack entries remain mutable runtime state outside the replacement.
+Invalid replacement arrays leave the prior registry and ring active.
 
-The unmatched policy defaults to `DROP`. `--default-action=allow` is an
-explicit transparent-forwarding/demo override; malformed packets always fail
-closed regardless of that option.
+## Metrics
 
-## Prometheus metrics
-
-`GET http://127.0.0.1:9090/metrics` exports:
+`GET http://127.0.0.1:9090/metrics` exports Prometheus text format. The port
+comes from `--metrics-port`. The endpoint also serves `GET /health`.
 
 - `engine_rx_packets_total`
 - `engine_tx_packets_total`
@@ -403,7 +353,7 @@ closed regardless of that option.
 - `engine_latency_seconds_sum`
 - `engine_latency_seconds_count`
 
-Packet and drop rates are counter deltas, for example:
+Packet and drop rates are counter deltas:
 
 ```promql
 rate(engine_rx_packets_total[1m])
@@ -412,55 +362,71 @@ histogram_quantile(0.50, sum by (le) (rate(engine_latency_seconds_bucket[5m])))
 histogram_quantile(0.99, sum by (le) (rate(engine_latency_seconds_bucket[5m])))
 ```
 
-The current runtime records one duration per processed DPDK batch and therefore
-this histogram describes application batch-processing time. It is not a
-hardware or end-to-end packet timestamp measurement.
+The runtime records one duration per processed batch, so the histogram
+describes application batch-processing time. It is not a hardware or end-to-end
+packet timestamp.
 
-## Reproducible benchmark result
+## Benchmark
 
-The committed result under `bench/results/dpdk-net-pcap/` was produced on the
-machine described in `result.json`. Each trial replays 10,000 deterministic
-60-byte packets, includes process startup/EAL initialization/replay/TX
-flush/teardown, and verifies every output record byte-for-byte against the input.
+The committed result in `bench/results/dpdk-net-pcap/` replays 10,000
+deterministic 60-byte packets per trial. Each trial includes process startup,
+EAL initialization, replay, TX flush, and teardown, and checks every output
+record byte-for-byte against the input.
 
 | Path | Status | Trials | Median packets/s | Drops | p50/p99 latency |
 |---|---:|---:|---:|---:|---|
 | DPDK `net_pcap` offline replay | PASS | 5 + 1 warmup | 27,850.459 | 0 | N/A |
-| AF_XDP live comparison | BLOCKED | 0 | N/A | N/A | Requires privileges/interface/memlock |
-| Linux kernel veth/nftables comparison | BLOCKED | 0 | N/A | N/A | Requires `CAP_NET_ADMIN` |
+| AF_XDP live comparison | BLOCKED | 0 | N/A | N/A | Requires privileges, interface, and memlock |
+| Linux kernel veth and nftables | BLOCKED | 0 | N/A | N/A | Requires `CAP_NET_ADMIN` |
 
-The DPDK number is machine-specific and startup-inclusive. It is useful as a
-reproducible functional throughput baseline, not as NIC forwarding capacity.
-Offline replay has no correlated ingress/egress packet timestamps, so mapping
-process duration to p50/p99 latency would fabricate a metric. The JSON records
-that limitation as `null` with a reason rather than substituting zeros.
+The measured trials ranged from 24,503.933 to 30,427.172 packets per second on
+the host recorded in `result.json`: an AMD Ryzen 7 5700X, kernel 7.1.3, DPDK
+26.03, and the `net_pcap` PMD. The spread is retained. The median is
+startup-inclusive and machine-specific, so it is a functional baseline, not NIC
+forwarding capacity.
 
-See [bench/README.md](bench/README.md) for the schema, commands, provenance,
-and privileged comparison protocol.
+Offline replay has no correlated ingress and egress timestamps. Mapping process
+duration to p50 or p99 latency would invent a metric, so the JSON records both
+as `null` with a reason.
 
-## Known limitations
+See [bench/README.md](bench/README.md) for the schema, provenance, and the
+privileged comparison protocol.
 
-- One queue and one polling thread are composed by the executable; multi-queue
+## Limits
+
+- One queue and one polling thread are composed by the executable. Multi-queue
   RSS and multi-core scaling are not claimed.
 - The active JSON policy path matches IPv4 only. IPv6 parsing works, but IPv6
-  rule publication, endpoint keys, and NAT are incomplete.
-- NAT currently targets TCP/UDP and the in-place forward path. No ICMP NAT,
-  IPv6 NAT, fragment reassembly, ALG, SYN proxy, or DDoS protection exists.
-- The executable uses one interface/DPDK port for both directions and supports
-  a static one-arm Ethernet next hop per backend. It does not implement ARP/ND,
-  dynamic neighbor discovery, routing tables, or distinct client/backend ports.
-- The current software-PMD evidence is copy-backed. A dedicated PCI PMD/NIC,
-  hugepage, IOMMU, NUMA, generator/receiver, and hardware counter matrix is
-  required for kernel-bypass, line-rate, lossless, cycles/packet, or zero-copy
-  performance claims.
-- The AF_XDP link is process-owned and unpinned. Missing/full XSK redirects
-  drop only while that link remains attached; crash-persistent firewall
-  deployments require an external pinned guard or kernel-path isolation.
-- NUMA-aware components are implemented, but the present one-thread runtime
-  does not expose a verified queue-to-core-to-NIC NUMA assignment report.
-- The control socket is local and unauthenticated; metrics are plaintext.
-- The project has no Kubernetes CNI implementation and no production hardening
-  or compatibility guarantee.
+  policy publication, endpoint keys, and NAT are incomplete.
+- NAT covers TCP and UDP and the in-place forward path. It has no ICMP NAT,
+  IPv6 NAT, fragment reassembly, ALG, SYN proxy, or DDoS protection.
+- The executable uses one interface or DPDK port for both directions and a
+  static one-arm Ethernet next hop per backend. It has no ARP, neighbor
+  discovery, routing table, or distinct client and backend ports.
+- The software-PMD evidence is copy-backed. Kernel bypass, line rate, lossless
+  forwarding, cycles per packet, and zero-copy claims need a dedicated PCI
+  PMD, hugepages, IOMMU, NUMA, independent generator and receiver, and hardware
+  counters.
+- The AF_XDP link is process-owned and unpinned. Missing or full XSK redirects
+  drop only while the link stays attached. A crash-persistent firewall needs an
+  external pinned guard or kernel-path isolation.
+- NUMA-aware components are implemented, but the one-thread runtime does not
+  expose a verified queue-to-core-to-NIC NUMA report.
+- The control socket is local and unauthenticated. Metrics are plaintext.
+- Kubernetes CNI support, production hardening, and compatibility guarantees
+  are out of scope.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `include/packet-engine/` | Public headers: parser, policy, NAT, backends, metrics |
+| `src/` | Implementation and the executable composition root |
+| `bpf/` | XDP redirect program built with the engine |
+| `tests/` | GoogleTest suites, mocks, and PCAP integration scripts |
+| `bench/` | Benchmark harness, protocol notes, and committed results |
+| `scripts/` | Build wrapper and veth development harness |
+| `docs/figures/` | Excalidraw sources, rendered PNGs, and the generator |
 
 ## References
 
